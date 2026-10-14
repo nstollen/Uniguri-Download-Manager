@@ -1,0 +1,165 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<title>UDM: settings</title>
+<link rel="icon" href="icons/icon32.png">
+<link rel="stylesheet" href="theme.css">
+<script src="theme.js"></script>
+<style>
+  body { padding: 20px 24px 40px; }
+  main { max-width: 720px; }
+  h1 { margin-bottom: 22px; }
+  section { padding: 16px 0 18px; border-top: 1px solid var(--border); }
+  h2 { font-size: 13px; font-weight: 650; margin: 0 0 10px; }
+  .line { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+  .line > span:first-child { width: 190px; flex: none; color: var(--text); }
+  label.line:has(input[type=checkbox]) { cursor: pointer; }
+  input[type=text] { flex: 1; min-width: 0; }
+  input[type=number] { width: 88px; }
+  .hint { margin: 2px 0 8px; }
+  .line .hint { margin: 0; }
+  section > .hint { padding-left: 200px; }
+  section > .hint.wide { padding-left: 0; }
+  #folders { margin: 8px 0 10px; }
+  #folders .line { margin: 6px 0; }
+  #folders .line input:first-child { flex: 0 0 150px; font-weight: 550; }
+  .line.top { align-items: flex-start; }
+  .line.top > span:first-child { padding-top: 6px; }
+  textarea { flex: 1; min-width: 0; resize: vertical; font: inherit; }
+  #bottom { position: sticky; bottom: 0; display: flex; align-items: center; gap: 12px; padding: 14px 0; border-top: 1px solid var(--border); background: var(--bg); }
+  #save { padding: 6px 20px; }
+  #note.bad { color: var(--fail-fg); }
+  #note.good { color: var(--run-fg); }
+  main > .hint { margin-top: 4px; }
+  .segmented { display: flex; padding: 3px; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; }
+  .segmented label { padding: 4px 14px; border: 1px solid transparent; border-radius: var(--radius); color: var(--muted); font-weight: 500; cursor: pointer; transition: background-color 150ms var(--ease), color 150ms var(--ease); }
+  .segmented label:hover { color: var(--text); background: var(--surface); }
+  .segmented label:has(:checked) { color: var(--text); background: var(--surface); border-color: var(--border); box-shadow: 0 1px 2px oklch(0.3 0.05 35 / 0.12); }
+  .segmented label:has(:focus-visible) { box-shadow: 0 0 0 3px var(--ring); }
+  .segmented input { position: absolute; opacity: 0; pointer-events: none; }
+
+  /* Clear data dialog */
+  dialog.clear { width: min(400px, 92vw); max-width: none; }
+  dialog.clear .line > span:first-child { width: auto; }
+  dialog.clear .line select { flex: 1; }
+  .what { display: grid; gap: 2px; margin: 10px 0 0; padding: 8px 0; border-top: 1px solid var(--border); }
+  .what label { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor: pointer; }
+  dialog.ask .what input { width: 15px; margin: 0; }
+  .what .count { margin-left: auto; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .what label.files { margin-top: 4px; padding-top: 10px; border-top: 1px solid var(--border); }
+  .what label.files:has(:checked) { color: var(--fail-fg); }
+  .what label:has(:disabled) { color: var(--muted); cursor: default; }
+  dialog.clear .detail { margin: 0 0 14px; }
+  dialog.clear .buttons { display: flex; gap: 8px; }
+  dialog.clear .buttons button { margin: 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1><img src="icons/icon128.png" alt=""> Uniguri Download Manager <span class="page">· Settings</span></h1>
+
+  <section>
+    <h2>Saving files</h2>
+    <label class="line"><span>Download folder</span><input type="text" id="folder"></label>
+    <div class="hint">Leave empty for the default folder: <span id="defaultFolder"></span></div>
+    <label class="line"><input type="checkbox" id="ask"> Ask where to save, and the file name, before each download</label>
+    <label class="line"><input type="checkbox" id="sortFolders"> Sort files into subfolders by type</label>
+    <div class="hint wide">Folder name, then its file extensions separated by spaces. Everything else goes to "other". Empty the name to remove a line.</div>
+    <div id="folders"></div>
+    <button id="addFolder">Add folder</button>
+  </section>
+
+  <section>
+    <h2>Downloads</h2>
+    <label class="line"><span>Downloads at the same time</span><input type="number" id="maxJobs" min="1" max="32"></label>
+    <label class="line"><span>Parts per download</span><input type="number" id="parts" min="1" max="32"></label>
+    <label class="line"><span>Speed limit, KB/s</span><input type="number" id="speedLimit" min="0"> <span class="hint">0 = no limit. Applies to direct files, not to streams.</span></label>
+    <label class="line"><input type="checkbox" id="limitSchedule"> Limit to <input type="number" id="limitSpeed" min="0"> KB/s from <input type="time" id="limitFrom"> to <input type="time" id="limitTo"></label>
+    <div class="hint wide">Bandwidth schedule. Outside that time the speed limit above is used. The time range may pass midnight.</div>
+  </section>
+
+  <section>
+    <h2>Capture</h2>
+    <div class="hint wide">Which browser downloads UDM takes. The others are downloaded by the browser as usual.
+      Hold <b>Alt</b> while clicking a link to let the browser download it once.</div>
+    <label class="line top"><span>Sites to ignore</span><textarea id="ignoreSites" rows="3" spellcheck="false" placeholder="one per line, like: example.com (its subdomains too)"></textarea></label>
+    <label class="line"><span>File types to catch</span><input type="text" id="captureTypes" spellcheck="false" placeholder="empty = every type, or like: zip exe mp4 pdf"></label>
+    <label class="line"><span>Minimum file size, KB</span><input type="number" id="minSize" min="0"> <span class="hint">0 = any size. Smaller files stay in the browser.</span></label>
+    <label class="line"><input type="checkbox" id="clipboardWatch"> Clipboard watch: when I copy a link to a file of these types, ask whether to download it</label>
+    <div class="hint wide" id="clipboardHint">With no file types above, the extensions of the folders under Saving files are used. Links to web pages never ask.</div>
+  </section>
+
+  <section>
+    <h2>Notifications</h2>
+    <label class="line"><input type="checkbox" id="notify"> Show a Windows notification when a download finishes or fails</label>
+  </section>
+
+  <section>
+    <h2>Scheduler</h2>
+    <label class="line"><input type="checkbox" id="scheduleStart"> Start the queue at <input type="time" id="startTime"> <span class="hint">resumes every paused download</span></label>
+    <label class="line"><input type="checkbox" id="scheduleStop"> Stop at <input type="time" id="stopTime"> <span class="hint">pauses every running and queued download</span></label>
+  </section>
+
+  <section>
+    <h2>Appearance</h2>
+    <div class="line">
+      <span>Theme</span>
+      <div id="theme" class="segmented" role="radiogroup" aria-label="Theme">
+        <label><input type="radio" name="theme" value="system"> System</label>
+        <label><input type="radio" name="theme" value="light"> Light</label>
+        <label><input type="radio" name="theme" value="dark"> Dark</label>
+      </div>
+      <span class="hint">Changes right away. System follows Windows.</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Privacy</h2>
+    <label class="line"><input type="checkbox" id="privateMode"> Private mode: new downloads are not saved to the history, stats, thumbnails or log</label>
+    <div class="hint wide">Changes right away. Downloads still work, and stay in the list until they finish or the downloader restarts.
+      Downloads from an incognito window are always private.</div>
+    <label class="line"><input type="checkbox" id="statsSites"> Record which site each download came from, for Top sites on the stats page</label>
+    <label class="line"><span>Auto clean</span>
+      <select id="autoClean"><option value="0">Never</option><option value="7">After 7 days</option><option value="30">After 30 days</option><option value="90">After 90 days</option></select>
+      <span class="hint">Deletes older history, stats, thumbnails and log lines at startup and once a day. Files stay.</span></label>
+    <div class="line"><button id="clearData" class="danger">Clear data…</button> <span class="hint" id="clearNote">History, stats, thumbnails and the log, for a time range you pick.</span></div>
+  </section>
+
+  <dialog id="clearDialog" class="ask clear">
+    <p>Clear data</p>
+    <label class="line"><span>Time range</span>
+      <select id="clearRange"><option value="3600">Last hour</option><option value="86400">Last 24 hours</option>
+        <option value="604800">Last 7 days</option><option value="2592000">Last 30 days</option><option value="0">All time</option></select></label>
+    <div class="what">
+      <label><input type="checkbox" data-what="history" checked> Download history <span class="count" data-count="history"></span></label>
+      <label><input type="checkbox" data-what="stats" checked> Stats <span class="count" data-count="stats"></span></label>
+      <label><input type="checkbox" data-what="thumbs" checked> Thumbnails <span class="count" data-count="thumbs"></span></label>
+      <label><input type="checkbox" data-what="log" checked> Log file (udm.log) <span class="count" data-count="log"></span></label>
+      <label class="files"><input type="checkbox" id="clearFiles"> Also delete the downloaded files <span class="count" data-count="files"></span></label>
+    </div>
+    <div class="detail">Running, queued and paused downloads are kept.</div>
+    <div class="buttons"><button id="clearGo" class="danger">Clear</button><button id="clearCancel">Cancel</button></div>
+  </dialog>
+
+  <section>
+    <h2>Backup</h2>
+    <div class="line">
+      <button id="export" title="History, stats, settings and capture rules in one json file">Export</button>
+      <button id="import" title="Replace history, stats, settings and capture rules with a backup">Import</button>
+      <input type="file" id="importFile" accept=".json,application/json" hidden>
+      <span class="hint" id="backupNote">History, stats, settings and capture rules, as one json file. Export asks what to include; Import asks before replacing anything.</span>
+    </div>
+  </section>
+
+  <div id="bottom">
+    <button id="save">Save</button>
+    <span id="note"></span>
+  </div>
+  <div class="hint">Saved by the downloader to settings.json, next to history.json, in <span id="dataFolder"></span></div>
+</main>
+  <script src="common.js"></script>
+  <script src="settings.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+# Windows files keep Windows line endings in every clone
+* text=auto
+*.bat text eol=crlf
+*.iss text eol=crlf
+*.txt text eol=crlf
+*.png binary
+*.ico binary

@@ -1,0 +1,9 @@
+{
+  "name": "com.udm.host",
+  "description": "Uniguri Download Manager native messaging host",
+  "path": "udm-host.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://nlpicpbemdokbpgkigobcbobbgbmbpfa/"
+  ]
+}

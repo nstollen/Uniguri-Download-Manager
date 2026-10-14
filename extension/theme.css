@@ -1,0 +1,279 @@
+/* Shared look for the popup, manager and settings pages.
+   Colors come from the hedgehog: spike brown, cream face, peach muzzle, green bow tie.
+   The theme setting (theme.js) picks light, dark, or system: follow Windows. */
+
+:root {
+  color-scheme: light dark;
+
+  --bg: oklch(0.975 0.012 75);          /* cream page */
+  --surface: oklch(0.995 0.005 75);     /* inputs, table */
+  --surface-2: oklch(0.95 0.018 70);    /* hover, toolbars, header row */
+  --border: oklch(0.89 0.02 60);
+  --border-strong: oklch(0.79 0.03 50);
+  --text: oklch(0.28 0.05 35);          /* spike brown, softened */
+  --muted: oklch(0.5 0.035 45);
+  --brand: oklch(0.36 0.1 30);          /* spike brown: primary buttons */
+  --brand-hover: oklch(0.3 0.09 30);
+  --on-brand: oklch(0.97 0.015 80);
+  --ring: oklch(0.6 0.13 145 / 0.55);   /* bow tie green */
+
+  /* job states: fg = text and bar, bg = badge fill */
+  --run: oklch(0.55 0.14 145);   --run-fg: oklch(0.45 0.12 145);  --run-bg: oklch(0.94 0.04 145);
+  --pause: oklch(0.72 0.13 70);  --pause-fg: oklch(0.5 0.11 65);  --pause-bg: oklch(0.95 0.045 75);
+  --done: oklch(0.45 0.08 40);   --done-fg: oklch(0.4 0.07 40);   --done-bg: oklch(0.93 0.02 60);
+  --fail: oklch(0.55 0.19 27);   --fail-fg: oklch(0.5 0.18 27);   --fail-bg: oklch(0.95 0.03 27);
+  --idle: oklch(0.7 0.03 50);    --idle-fg: oklch(0.5 0.035 45);  --idle-bg: oklch(0.94 0.012 60);
+  --track: oklch(0.91 0.018 65);
+  --chart: oklch(0.58 0.13 42);         /* stats bars: terracotta from the spike brown, checked with the dataviz validator */
+
+  --radius: 6px;
+  --radius-sm: 4px;
+  --font: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Dark tokens: used when the theme setting is "system" and Windows is dark, or when it is "dark".
+   The same block twice, because a media query cannot share a rule with a selector. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme=light]) {
+    --bg: oklch(0.2 0.02 35);
+    --surface: oklch(0.24 0.025 35);
+    --surface-2: oklch(0.28 0.03 35);
+    --border: oklch(0.33 0.03 35);
+    --border-strong: oklch(0.42 0.035 40);
+    --text: oklch(0.93 0.02 75);
+    --muted: oklch(0.74 0.03 60);
+    --brand: oklch(0.84 0.08 70);       /* peach muzzle */
+    --brand-hover: oklch(0.89 0.07 72);
+    --on-brand: oklch(0.25 0.05 35);
+    --ring: oklch(0.75 0.14 145 / 0.6);
+
+    --run: oklch(0.72 0.15 145);   --run-fg: oklch(0.78 0.14 145);  --run-bg: oklch(0.3 0.05 145);
+    --pause: oklch(0.8 0.13 75);   --pause-fg: oklch(0.82 0.12 75); --pause-bg: oklch(0.3 0.05 70);
+    --done: oklch(0.78 0.05 65);   --done-fg: oklch(0.84 0.04 65);  --done-bg: oklch(0.3 0.03 50);
+    --fail: oklch(0.68 0.17 25);   --fail-fg: oklch(0.74 0.15 25);  --fail-bg: oklch(0.3 0.06 25);
+    --idle: oklch(0.55 0.03 50);   --idle-fg: oklch(0.74 0.03 60);  --idle-bg: oklch(0.29 0.02 40);
+    --track: oklch(0.32 0.03 35);
+    --chart: oklch(0.66 0.12 50);
+  }
+}
+
+:root[data-theme=dark] {
+  color-scheme: dark;
+  --bg: oklch(0.2 0.02 35);
+  --surface: oklch(0.24 0.025 35);
+  --surface-2: oklch(0.28 0.03 35);
+  --border: oklch(0.33 0.03 35);
+  --border-strong: oklch(0.42 0.035 40);
+  --text: oklch(0.93 0.02 75);
+  --muted: oklch(0.74 0.03 60);
+  --brand: oklch(0.84 0.08 70);       /* peach muzzle */
+  --brand-hover: oklch(0.89 0.07 72);
+  --on-brand: oklch(0.25 0.05 35);
+  --ring: oklch(0.75 0.14 145 / 0.6);
+
+  --run: oklch(0.72 0.15 145);   --run-fg: oklch(0.78 0.14 145);  --run-bg: oklch(0.3 0.05 145);
+  --pause: oklch(0.8 0.13 75);   --pause-fg: oklch(0.82 0.12 75); --pause-bg: oklch(0.3 0.05 70);
+  --done: oklch(0.78 0.05 65);   --done-fg: oklch(0.84 0.04 65);  --done-bg: oklch(0.3 0.03 50);
+  --fail: oklch(0.68 0.17 25);   --fail-fg: oklch(0.74 0.15 25);  --fail-bg: oklch(0.3 0.06 25);
+  --idle: oklch(0.55 0.03 50);   --idle-fg: oklch(0.74 0.03 60);  --idle-bg: oklch(0.29 0.02 40);
+  --track: oklch(0.32 0.03 35);
+  --chart: oklch(0.66 0.12 50);
+}
+
+:root[data-theme=light] { color-scheme: light; }
+
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; } /* page rules like display: inline-block must not show hidden things */
+
+body {
+  margin: 0;
+  font: 13px/1.45 var(--font);
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---- page title: logo, app name, page name ---- */
+h1 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  font-size: 18px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+h1 img { width: 40px; height: 40px; flex: none; }
+h1 .page { font-weight: 400; color: var(--muted); }
+
+/* ---- buttons ---- */
+button {
+  font: inherit;
+  font-weight: 500;
+  line-height: 1.2;
+  padding: 5px 12px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 150ms var(--ease), border-color 150ms var(--ease), color 150ms var(--ease);
+}
+button:hover { background: var(--surface-2); }
+button:active { background: var(--border); }
+button:disabled { opacity: 0.5; cursor: default; background: var(--surface); }
+button.primary, #save, #addUrl {
+  color: var(--on-brand);
+  background: var(--brand);
+  border-color: var(--brand);
+}
+button.primary:hover, #save:hover, #addUrl:hover { background: var(--brand-hover); border-color: var(--brand-hover); }
+button.primary:disabled { background: var(--brand); }
+
+/* per-job buttons: compact; destructive ones turn red on hover; the extra ones are quieter */
+.actions { display: flex; flex-wrap: wrap; gap: 4px; }
+.actions button { font-size: 12px; padding: 2px 8px; border-radius: var(--radius-sm); }
+.actions button:not([data-action]) { border-color: transparent; background: transparent; color: var(--muted); }
+.actions button:not([data-action]):hover { background: var(--surface-2); color: var(--text); }
+.actions button[data-action=cancel]:hover,
+.actions button[data-action=delete]:hover { color: var(--fail-fg); border-color: var(--fail); background: var(--fail-bg); }
+
+/* ---- inputs ---- */
+input[type=text], input[type=url], input[type=search], input[type=number], input[type=time], select, textarea {
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 5px 8px;
+  transition: border-color 150ms var(--ease), box-shadow 150ms var(--ease);
+}
+input::placeholder, textarea::placeholder { color: var(--muted); opacity: 0.8; }
+select { cursor: pointer; }
+input[type=checkbox] { accent-color: var(--run); width: 15px; height: 15px; margin: 0; }
+input[type=number] { font-variant-numeric: tabular-nums; }
+
+:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--ring); }
+input:focus-visible, select:focus-visible, textarea:focus-visible { border-color: var(--run); }
+
+/* ---- progress bars: thin, rounded, colored by job state ---- */
+progress {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 6px;
+  border: 0;
+  border-radius: 99px;
+  background: var(--track);
+  overflow: hidden;
+  vertical-align: middle;
+}
+progress::-webkit-progress-bar { background: var(--track); border-radius: 99px; }
+progress::-webkit-progress-value { background: var(--bar, var(--run)); border-radius: 99px; transition: width 300ms var(--ease); }
+[data-state=running] progress::-webkit-progress-value {
+  background: var(--run) linear-gradient(110deg, transparent 30%, oklch(1 0 0 / 0.28) 50%, transparent 70%) 0 0 / 200% 100%;
+  animation: flow 1.6s linear infinite;
+}
+@keyframes flow { to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) {
+  [data-state=running] progress::-webkit-progress-value { animation: none; }
+}
+
+[data-state=running] { --bar: var(--run);   --st-fg: var(--run-fg);   --st-bg: var(--run-bg); }
+[data-state=paused],
+[data-state=stopped] { --bar: var(--pause); --st-fg: var(--pause-fg); --st-bg: var(--pause-bg); }
+[data-state=done]    { --bar: var(--done);  --st-fg: var(--done-fg);  --st-bg: var(--done-bg); }
+[data-state=failed]  { --bar: var(--fail);  --st-fg: var(--fail-fg);  --st-bg: var(--fail-bg); }
+[data-state=queued],
+[data-state=canceled] { --bar: var(--idle); --st-fg: var(--idle-fg); --st-bg: var(--idle-bg); }
+
+/* a colored dot before a status text */
+.dot::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--bar, var(--idle));
+  vertical-align: 1px;
+}
+
+.failed { color: var(--fail-fg); }
+
+/* ---- dialogs (delete, speed limit) ---- */
+dialog.ask {
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+  max-width: 420px;
+  box-shadow: 0 12px 32px oklch(0.2 0.04 35 / 0.25);
+}
+dialog.ask::backdrop { background: oklch(0.2 0.04 35 / 0.35); }
+dialog.ask p { margin: 0 0 12px; font-weight: 600; overflow-wrap: anywhere; }
+dialog.ask button { margin: 6px 4px 0 0; }
+dialog.ask button[data-choice=file] { color: var(--fail-fg); border-color: var(--fail); }
+dialog.ask button[data-choice=file]:hover { background: var(--fail-bg); }
+dialog.ask input { width: 100px; margin-right: 4px; }
+dialog.ask.wide { width: min(560px, 92vw); max-width: none; }
+dialog.ask.wide input { width: 100%; margin: 0 0 6px; font-family: Consolas, "Cascadia Mono", monospace; }
+dialog.ask .detail { margin: -6px 0 12px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+
+.hint { color: var(--muted); font-size: 12px; }
+
+/* ---- privacy: the private mode switch, the "private" badge, a row's private tag, delete buttons ---- */
+.toggle { display: inline-flex; align-items: center; gap: 7px; }
+.toggle .switch {
+  position: relative;
+  width: 24px;
+  height: 14px;
+  flex: none;
+  border-radius: 99px;
+  background: var(--track);
+  border: 1px solid var(--border-strong);
+  transition: background-color 150ms var(--ease), border-color 150ms var(--ease);
+}
+.toggle .switch::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: transform 150ms var(--ease), background-color 150ms var(--ease);
+}
+.toggle[aria-pressed=true] .switch { background: var(--brand); border-color: var(--brand); }
+.toggle[aria-pressed=true] .switch::after { transform: translateX(10px); background: var(--on-brand); }
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  font-size: 10.5px;
+  font-weight: 650;
+  line-height: 1.6;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--on-brand);
+  background: var(--brand);
+  border-radius: 99px;
+}
+.tag {
+  display: inline-block;
+  flex: none;
+  padding: 0 5px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.6;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+dialog.ask button[data-choice=delete], button.danger { color: var(--fail-fg); border-color: var(--fail); }
+dialog.ask button[data-choice=delete]:hover, button.danger:hover { background: var(--fail-bg); }
+button.danger:disabled { color: var(--muted); border-color: var(--border-strong); background: var(--surface); }

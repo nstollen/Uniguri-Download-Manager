@@ -1,0 +1,141 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<title>UDM: downloads</title>
+<link rel="icon" href="icons/icon32.png">
+<link rel="stylesheet" href="theme.css">
+<script src="theme.js"></script>
+<style>
+  body { padding: 20px 24px 32px; }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+  .space { flex: 1; }
+  #theme { color: var(--muted); }
+  #theme b { color: var(--text); font-weight: 600; }
+
+  /* add a link + queue settings */
+  #tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 24px; padding: 10px 12px; margin-bottom: 16px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; }
+  #add { display: flex; flex: 1 1 420px; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #url { flex: 1; min-width: 220px; max-width: 640px; }
+  #addNote { color: var(--fail-fg); font-size: 12px; }
+  #addNote:empty { display: none; }
+  #queue { display: flex; flex-wrap: wrap; gap: 8px 18px; color: var(--muted); font-size: 12px; }
+  #queue label { display: flex; align-items: center; gap: 6px; }
+  #queue input { width: 64px; padding: 3px 6px; }
+  #queue select { padding: 3px 6px; }
+  #limitNow { color: var(--pause-fg); }
+
+  /* filters, search and the bulk buttons */
+  #top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
+  #filters { display: flex; padding: 3px; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; }
+  #filters button { border-color: transparent; background: transparent; color: var(--muted); padding: 4px 10px; font-variant-numeric: tabular-nums; }
+  #filters button:hover { color: var(--text); background: var(--surface); }
+  #filters button.on { color: var(--text); background: var(--surface); border-color: var(--border); box-shadow: 0 1px 2px oklch(0.3 0.05 35 / 0.12); }
+  #search { flex: 1; min-width: 160px; max-width: 300px; }
+
+  #offline { padding: 8px 12px; margin-bottom: 12px; color: var(--fail-fg); background: var(--fail-bg); border: 1px solid var(--fail); border-radius: var(--radius); }
+
+  /* the job table */
+  .table { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  table { border-collapse: collapse; width: 100%; }
+  th { text-align: left; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); background: var(--surface-2); border-bottom: 1px solid var(--border); padding: 8px 10px; white-space: nowrap; }
+  td { border-bottom: 1px solid var(--border); padding: 9px 10px; vertical-align: middle; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr { transition: background-color 150ms var(--ease); }
+  tbody tr:hover { background: color-mix(in oklch, var(--surface-2) 55%, transparent); }
+  td.name { max-width: 320px; font-weight: 550; }
+  td.name .cell { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  td.name .text { overflow: hidden; text-overflow: ellipsis; }
+  td.name .tag { margin-left: -2px; }
+  td.name img { flex: none; width: 64px; height: 36px; object-fit: cover; border-radius: var(--radius-sm); background: var(--surface-2); }
+  tbody tr { cursor: default; }
+  tbody tr.selected, tbody tr.selected:hover { background: color-mix(in oklch, var(--brand) 10%, var(--surface)); }
+  #keysButton { width: 32px; padding-inline: 0; font-weight: 650; }
+  .keys { border-collapse: collapse; margin: 0 0 12px; }
+  .keys td { padding: 4px 14px 4px 0; border: 0; white-space: nowrap; }
+  kbd { display: inline-block; min-width: 22px; padding: 1px 6px; font: 600 11px/1.5 var(--font); text-align: center; color: var(--text); background: var(--surface-2); border: 1px solid var(--border-strong); border-bottom-width: 2px; border-radius: var(--radius-sm); }
+  td.size, td.speed, td.eta { color: var(--muted); }
+  td.progress progress { width: 120px; }
+  td.progress span { display: inline-block; width: 46px; text-align: right; font-size: 12px; color: var(--muted); }
+  td.status { white-space: normal; max-width: 260px; color: var(--st-fg, var(--muted)); font-weight: 500; }
+  td.status::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 7px; border-radius: 50%; background: var(--bar, var(--idle)); vertical-align: 1px; }
+  td.status .hash { margin-top: 4px; font-size: 11px; font-weight: 400; color: var(--muted); }
+  td.status .hash code { font: 11px/1.35 Consolas, "Cascadia Mono", monospace; color: var(--text); word-break: break-all; user-select: all; cursor: text; }
+  td.status .hash .match { color: var(--run-fg); }
+  td.status .hash .nomatch { color: var(--fail-fg); }
+  td.added { color: var(--muted); font-size: 12px; }
+  td.buttons { white-space: normal; min-width: 230px; }
+
+  #empty { padding: 28px; text-align: center; color: var(--muted); }
+  #note { color: var(--muted); font-size: 12px; margin: 12px 2px 0; }
+</style>
+</head>
+<body>
+  <header>
+    <h1><img src="icons/icon128.png" alt=""> Uniguri Download Manager <span class="page">· Downloads</span> <span class="badge" id="privateBadge" hidden>Private</span></h1>
+    <span class="space"></span>
+    <button id="private" class="toggle"><span class="switch"></span>Private mode</button>
+    <button id="theme" title="Theme: system (follows Windows), light, or dark. Click to switch."></button>
+    <button id="stats" title="Total downloaded, downloads per day, top sites">Stats</button>
+    <button id="settings">Settings</button>
+    <button id="keysButton" title="Keyboard shortcuts" aria-label="Keyboard shortcuts">?</button>
+  </header>
+  <dialog id="keys" class="ask">
+    <p>Keyboard shortcuts</p>
+    <table class="keys">
+      <tr><td><kbd>↑</kbd> <kbd>↓</kbd></td><td>Move between rows (or click a row)</td></tr>
+      <tr><td><kbd>Space</kbd></td><td>Pause or resume the selected download</td></tr>
+      <tr><td><kbd>Delete</kbd></td><td>Delete it (asks first)</td></tr>
+      <tr><td><kbd>Enter</kbd></td><td>Open the finished file</td></tr>
+      <tr><td><kbd>Ctrl</kbd> <kbd>F</kbd></td><td>Search by name</td></tr>
+      <tr><td><kbd>?</kbd></td><td>This list</td></tr>
+    </table>
+    <button id="keysClose">Close</button>
+  </dialog>
+  <div id="offline" hidden>The downloader is not running. Start it with: python downloader\downloader.py</div>
+  <div id="tools">
+    <div id="add">
+      <input id="url" type="url" placeholder="Paste a link (http or https) to download">
+      <button id="addUrl">Add URL</button>
+      <span id="addNote"></span>
+    </div>
+    <div id="queue">
+      <label>Downloads at once <input type="number" min="1" data-setting="maxJobs"></label>
+      <label>Parts per download <input type="number" min="1" data-setting="parts"></label>
+      <label title="For direct files. Streams are not limited.">Speed limit, KB/s (0 = off) <input type="number" min="0" data-setting="speedLimit"> <span id="limitNow"></span></label>
+      <label title="Once, when the last download finishes and nothing else runs or waits. Sleep and Shut down first count down 60 seconds in a small window, with Cancel. Then it goes back to Do nothing.">When all are done
+        <select data-setting="afterDone">
+          <option value="nothing">Do nothing</option><option value="sleep">Sleep</option>
+          <option value="shutdown">Shut down</option><option value="quit">Close the downloader</option>
+        </select></label>
+    </div>
+  </div>
+  <div id="top">
+    <div id="filters">
+      <button data-filter="all">All</button>
+      <button data-filter="downloading">Downloading</button>
+      <button data-filter="paused">Paused</button>
+      <button data-filter="done">Done</button>
+      <button data-filter="failed">Failed</button>
+    </div>
+    <input id="search" type="search" placeholder="Search by name">
+    <span class="space"></span>
+    <button id="startAll" title="Resumes every paused download and restarts every stopped stream">Start all</button>
+    <button id="pauseAll" title="Pauses every running and queued download (streams are stopped)">Pause all</button>
+    <button id="clear" title="Removes done and canceled jobs from the list. The files stay on disk.">Clear finished</button>
+  </div>
+  <div class="table">
+    <table>
+      <thead>
+        <tr><th>Name</th><th>Size</th><th>Progress</th><th>Speed</th><th>Time left</th><th>Status</th><th>Added</th><th>Actions</th></tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="empty" hidden>No downloads here.</div>
+  </div>
+  <div id="note">Streams (m3u8/mpd) cannot be paused. <b>Stop</b> ends the download and <b>Restart</b> downloads it again from the beginning.</div>
+  <script src="common.js"></script>
+  <script src="manager.js"></script>
+</body>
+</html>

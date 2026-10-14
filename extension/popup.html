@@ -1,0 +1,105 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<link rel="stylesheet" href="theme.css">
+<script src="theme.js"></script>
+<style>
+  html { overflow-x: hidden; }
+  body { width: 380px; padding: 12px 14px 14px; }
+  .top { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  h1 { flex: 1; min-width: 0; font-size: 14px; gap: 8px; }
+  #private { padding: 4px 8px; font-size: 12px; }
+  /* on: the switch turns into the "private" badge, so the header keeps one line */
+  #private[aria-pressed=true] { padding: 3px 9px 3px 6px; font-size: 10.5px; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--on-brand); background: var(--brand); border-color: var(--brand); border-radius: 99px; }
+  #private[aria-pressed=true]:hover { background: var(--brand-hover); }
+  #private[aria-pressed=true] .switch { border-color: var(--on-brand); }
+  .name .tag { margin-left: 6px; vertical-align: 1px; }
+  h1 img { width: 28px; height: 28px; }
+  h2 { font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); margin: 14px 0 4px; }
+
+  .row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-top: 1px solid var(--border); }
+  .info { flex: 1; min-width: 0; }
+  .name { font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .meta { color: var(--muted); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+  .meta.failed { color: var(--fail-fg); white-space: normal; }
+  #list .row > button { padding: 5px 10px; }
+  #list .row > button + button { margin-left: -4px; }
+
+  /* quality and subtitle picker for a stream, under its row */
+  .picker { display: grid; gap: 10px; padding: 10px 12px; margin: 0 0 8px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); }
+  .picker .field { display: grid; grid-template-columns: 62px 1fr; align-items: center; gap: 8px; }
+  .picker .field > span { color: var(--muted); font-size: 12px; }
+  .picker .field.subs { grid-template-columns: 62px 1fr auto; align-items: start; }
+  .picker .field.subs > span { padding-top: 2px; }
+  .picker select { min-width: 0; }
+  .picker .checks { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+  .picker .check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+  .picker-actions { display: flex; justify-content: flex-end; gap: 6px; }
+
+  /* job rows: bar, then a status line that starts with a colored dot */
+  .job .meta { color: var(--st-fg, var(--muted)); }
+  .job .meta::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: var(--bar, var(--idle)); vertical-align: 1px; }
+  .bar { display: flex; align-items: center; gap: 8px; margin: 5px 0 3px; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .bar progress { flex: 1; }
+  .bar span { width: 40px; text-align: right; }
+  .bar[hidden] { display: none; }
+  .actions { margin-top: 6px; }
+  dialog.ask { width: 300px; font-size: 12px; }
+
+  #blob { padding: 8px 10px; margin-bottom: 4px; font-size: 12px; color: var(--text); background: var(--pause-bg); border: 1px solid var(--pause); border-radius: var(--radius); }
+  #empty { color: var(--muted); padding: 10px 0 4px; border-top: 1px solid var(--border); }
+  #foot { display: flex; gap: 8px; border-top: 1px solid var(--border); margin-top: 8px; padding-top: 12px; }
+  #foot button { flex: 1; padding: 7px 10px; }
+
+  /* Download all links: a second view of the popup */
+  #links { display: grid; gap: 8px; }
+  .links-head { display: flex; align-items: center; gap: 8px; }
+  .links-head h2 { margin: 0; flex: 1; }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .chips button { padding: 2px 8px; font-size: 12px; border-radius: 99px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .chips button.on { color: var(--on-brand); background: var(--brand); border-color: var(--brand); }
+  .chips button:disabled { opacity: 0.4; }
+  #linkFilter { width: 100%; }
+  .select-all { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  #linkList { max-height: 300px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+  .link { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-top: 1px solid var(--border); cursor: pointer; }
+  .link:first-child { border-top: 0; }
+  .link:hover { background: var(--surface-2); }
+  .link .type { flex: none; min-width: 38px; padding: 1px 5px; font-size: 10px; font-weight: 600; text-align: center; text-transform: uppercase; color: var(--muted); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+  #linkList .empty { padding: 14px; color: var(--muted); text-align: center; }
+  .links-foot { display: flex; align-items: center; gap: 8px; }
+  #linksNote { flex: 1; font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+  <div class="top">
+    <h1><img src="icons/icon128.png" alt=""> Uniguri Download Manager <span class="badge" id="privateBadge" hidden title="This is an incognito window: downloads from it are always private.">Incognito</span></h1>
+    <button id="private" class="toggle"><span class="switch"></span>Private</button>
+  </div>
+  <div id="main">
+    <div id="blob" hidden></div>
+    <h2>Videos on this page</h2>
+    <div id="list"></div>
+    <h2 id="jobsTitle" hidden>Latest downloads</h2>
+    <div id="jobs"></div>
+    <div id="foot"><button id="allLinks" title="Every link on this page, to pick and download">Download all links</button><button id="manager">Open download manager</button></div>
+  </div>
+  <div id="links" hidden>
+    <div class="links-head"><button id="linksBack">Back</button><h2>Links on this page</h2></div>
+    <div class="chips" id="types">
+      <button data-type="all">All</button><button data-type="video">Video</button><button data-type="music">Music</button>
+      <button data-type="documents">Documents</button><button data-type="compressed">Compressed</button>
+      <button data-type="programs">Programs</button><button data-type="images">Images</button>
+    </div>
+    <input id="linkFilter" type="search" placeholder="Filter by name or address">
+    <label class="select-all"><input type="checkbox" id="selectAll"> Select all <span id="linkCount"></span></label>
+    <div id="linkList"></div>
+    <div class="links-foot"><span id="linksNote"></span><button id="downloadSelected" class="primary" disabled>Download selected</button></div>
+  </div>
+  <script src="common.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

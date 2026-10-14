@@ -1,0 +1,92 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<title>UDM: stats</title>
+<link rel="icon" href="icons/icon32.png">
+<link rel="stylesheet" href="theme.css">
+<script src="theme.js"></script>
+<style>
+  body { padding: 20px 24px 40px; }
+  main { max-width: 900px; display: grid; gap: 28px; }
+  header { display: flex; align-items: center; gap: 12px; }
+  header .space { flex: 1; }
+  h2 { font-size: 13px; font-weight: 650; margin: 0 0 12px; }
+  .hint { margin: 0; }
+
+  /* the three numbers */
+  #figures { display: flex; flex-wrap: wrap; gap: 12px 40px; padding: 4px 0; }
+  .figure .label { color: var(--muted); font-size: 12px; }
+  .figure .value { font-size: 26px; font-weight: 600; letter-spacing: -0.01em; }
+
+  /* downloads per day: one column per day, grows from the baseline */
+  .chart { position: relative; display: grid; grid-template-columns: 34px 1fr; gap: 6px; }
+  .ticks { position: relative; height: 180px; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .ticks span { position: absolute; right: 0; transform: translateY(50%); }
+  .plot { position: relative; height: 180px; display: flex; align-items: flex-end; border-bottom: 1px solid var(--border-strong); }
+  .grid { position: absolute; left: 0; right: 0; border-top: 1px solid var(--border); }
+  .day { position: relative; flex: 1; height: 100%; display: flex; align-items: flex-end; justify-content: center; outline: none; }
+  .day .bar { width: min(18px, calc(100% - 2px)); background: var(--chart); border-radius: 4px 4px 0 0; }
+  .day:hover, .day:focus-visible { background: color-mix(in oklch, var(--surface-2) 70%, transparent); }
+  .day:focus-visible { box-shadow: inset 0 0 0 2px var(--ring); }
+  .dates { grid-column: 2; display: flex; font-size: 11px; color: var(--muted); }
+  .dates span { flex: 1; white-space: nowrap; }
+  #tip { position: absolute; z-index: 1; pointer-events: none; padding: 6px 9px; font-size: 12px; line-height: 1.35; white-space: nowrap;
+         color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: 0 4px 14px oklch(0.2 0.04 35 / 0.18); }
+  #tip b { display: block; }
+
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th { text-align: left; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
+  th.num, td.num { text-align: right; }
+  .table { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin-top: 10px; }
+  details .table { margin-top: 8px; max-height: 320px; overflow-y: auto; }
+  #empty { color: var(--muted); }
+  td.forget { width: 1%; padding-block: 4px; text-align: right; }
+  td.forget button { font-size: 12px; padding: 2px 8px; border-color: transparent; background: transparent; color: var(--muted); }
+  td.forget button:hover { color: var(--fail-fg); border-color: var(--fail); background: var(--fail-bg); }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1><img src="icons/icon128.png" alt=""> Uniguri Download Manager <span class="page">· Stats</span></h1>
+    <span class="space"></span>
+    <button id="downloads">Downloads</button>
+  </header>
+  <div id="offline" class="failed" hidden>The downloader is not running, so there are no stats to show.</div>
+
+  <section id="figures">
+    <div class="figure"><div class="label">Total downloaded</div><div class="value" id="total">-</div></div>
+    <div class="figure"><div class="label">Files</div><div class="value" id="files">-</div></div>
+    <div class="figure"><div class="label">Average speed</div><div class="value" id="speed">-</div></div>
+  </section>
+
+  <section>
+    <h2>Downloads per day, last 30 days</h2>
+    <div class="chart">
+      <div class="ticks" id="ticks"></div>
+      <div class="plot" id="plot"></div>
+      <div class="dates" id="dates"></div>
+      <div id="tip" hidden></div>
+    </div>
+    <details>
+      <summary>Show as a table</summary>
+      <div class="table"><table><thead><tr><th>Day</th><th class="num">Files</th><th class="num">Size</th></tr></thead><tbody id="dayRows"></tbody></table></div>
+    </details>
+  </section>
+
+  <section id="sites">
+    <h2>Top sites</h2>
+    <div class="table" id="sitesBox"><table><thead><tr><th>Site</th><th class="num">Files</th><th class="num">Size</th><th><span class="sr">Forget</span></th></tr></thead><tbody id="siteRows"></tbody></table></div>
+    <p id="empty" hidden>Nothing downloaded yet.</p>
+    <p class="hint">Counted from every finished download, also after it was removed from the list.</p>
+  </section>
+</main>
+<script src="common.js"></script>
+<script src="stats.js"></script>
+</body>
+</html>

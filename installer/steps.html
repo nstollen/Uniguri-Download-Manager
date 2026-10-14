@@ -1,0 +1,88 @@
+<!doctype html>
+<!-- Opened by the installer at the end (Finish), from the install folder: the extension folder is next to it. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>UDM: add to your browser</title>
+<link rel="icon" href="extension/icons/icon32.png">
+<link rel="stylesheet" href="extension/theme.css">
+<style>
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.55 var(--font); }
+  main { max-width: 620px; margin: 0 auto; padding: 40px 20px 56px; }
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 8px; }
+  header img { width: 56px; height: 56px; }
+  h1 { margin: 0; font-size: 24px; line-height: 1.2; text-wrap: balance; }
+  .lead { margin: 0 0 28px; color: var(--muted); }
+  ol { list-style: none; counter-reset: step; margin: 0; padding: 0; display: grid; gap: 14px; }
+  li { counter-increment: step; display: grid; grid-template-columns: 34px 1fr; gap: 4px 12px;
+       padding: 16px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+  li::before { content: counter(step); grid-row: span 2; width: 30px; height: 30px; border-radius: 50%;
+               display: grid; place-items: center; background: var(--brand); color: var(--on-brand); font-weight: 600; }
+  li b { font-weight: 600; }
+  li p { margin: 0; color: var(--muted); }
+  .copy { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; }
+  code { font: 13px/1.4 Consolas, "Cascadia Mono", monospace; padding: 4px 8px; border-radius: var(--radius-sm);
+         background: var(--surface-2); border: 1px solid var(--border); color: var(--text); overflow-wrap: anywhere; }
+  button { font: inherit; font-size: 13px; padding: 3px 12px; border-radius: var(--radius-sm); cursor: pointer;
+           border: 1px solid var(--border-strong); background: var(--surface); color: var(--text); }
+  button:hover { background: var(--surface-2); }
+  button:focus-visible { outline: 3px solid var(--ring); outline-offset: 1px; }
+  .after { margin-top: 28px; color: var(--muted); font-size: 14px; }
+  .after p { margin: 0 0 8px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <img src="extension/icons/icon128.png" alt="">
+    <h1>Add UDM to your browser</h1>
+  </header>
+  <p class="lead">The UDM downloader is running: its hedgehog icon is near the clock. One last thing, done once: load the extension.</p>
+  <ol>
+    <li>
+      <b>Open the extensions page</b>
+      <p>Type this in the address bar:</p>
+      <div class="copy" style="grid-column: 2">
+        <code>chrome://extensions</code><button data-copy="chrome://extensions">Copy</button>
+      </div>
+      <p style="grid-column: 2">In Brave: <code>brave://extensions</code>, in Edge: <code>edge://extensions</code></p>
+    </li>
+    <li>
+      <b>Turn on Developer mode</b>
+      <p>The switch is at the top right (in Edge, on the left).</p>
+    </li>
+    <li>
+      <b>Click Load unpacked and pick this folder</b>
+      <p>It is open in Explorer too. You can paste the path into the folder box.</p>
+      <div class="copy" style="grid-column: 2">
+        <code id="folder">extension</code><button data-copy-from="folder">Copy</button>
+      </div>
+    </li>
+  </ol>
+  <div class="after">
+    <p>Done: the UDM button is in the toolbar's puzzle-piece menu. Pin it to keep it in sight. Downloads now go to <b>Downloads\udm</b>.</p>
+    <p>Keep the extension folder where it is: the browser loads UDM from there. After an update, press the reload arrow on UDM on the extensions page.</p>
+  </div>
+</main>
+<script>
+  // the extension folder is next to this page: file:///C:/Users/.../UDM/steps.html -> C:\Users\...\UDM\extension
+  const page = decodeURIComponent(location.pathname).replace(/^\//, "").replaceAll("/", "\\");
+  document.getElementById("folder").textContent = page.replace(/[^\\]*$/, "extension");
+
+  // Copy buttons: the text to the clipboard, or (if the browser says no) selected, ready for Ctrl+C
+  for (const button of document.querySelectorAll("button")) {
+    button.addEventListener("click", async () => {
+      const text = button.dataset.copy || document.getElementById(button.dataset.copyFrom).textContent;
+      try {
+        await navigator.clipboard.writeText(text);
+        button.textContent = "Copied";
+      } catch {
+        getSelection().selectAllChildren(button.previousElementSibling);
+        button.textContent = "Press Ctrl+C";
+      }
+      setTimeout(() => (button.textContent = "Copy"), 2000);
+    });
+  }
+</script>
+</body>
+</html>

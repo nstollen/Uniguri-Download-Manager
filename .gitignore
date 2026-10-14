@@ -1,0 +1,31 @@
+# private key of the extension (keep it outside the repo)
+*.pem
+
+# UDM data: history, settings, stats, log, thumbnails (in case a data folder is copied in)
+history.json
+settings.json
+stats.json
+*.log
+thumbs/
+*.json.tmp
+
+# build output: PyInstaller work and exes, the installer
+build/
+dist/
+*.spec
+UDM-Setup*.exe
+
+# ffmpeg is downloaded separately (see README, Build it yourself)
+ffmpeg.exe
+ffprobe.exe
+
+# written by host\install_host.py with this PC's Python and folder
+host/host.bat
+
+# Python
+__pycache__/
+*.pyc
+
+# downloads in progress
+*.part[0-9]*
+*.progress.json

@@ -1,0 +1,69 @@
+How to install UDM (Uniguri Download Manager)
+=============================================
+
+UDM is a download manager for Chrome, Brave and Edge on Windows 10 and 11.
+It has two parts: a small program that does the downloads, and a browser extension.
+You do not need Python or anything else.
+
+
+1. Run the installer
+--------------------
+Double-click UDM-Setup.exe.
+
+Windows may show a blue box: "Windows protected your PC". This is SmartScreen. It shows
+for programs that are not signed by a company. To go on:
+  - click "More info"
+  - click "Run anyway"
+
+You do not need to be an administrator. UDM installs to %LOCALAPPDATA%\UDM.
+At the end, the UDM downloader starts (a hedgehog icon near the clock) and a folder
+called "extension" opens.
+
+
+2. Add the extension to your browser
+------------------------------------
+  1. Open chrome://extensions
+     (Brave: brave://extensions, Edge: edge://extensions). Type it in the address bar.
+  2. Turn on "Developer mode" (top right; in Edge it is on the left).
+  3. Click "Load unpacked" and pick the extension folder:
+     %LOCALAPPDATA%\UDM\extension
+     (the folder that opened at the end of the install)
+
+The UDM button is now in the puzzle-piece menu of the toolbar. Pin it to keep it visible.
+Downloads you start in the browser now go to UDM. They are saved to Downloads\udm.
+
+Do not move or delete the extension folder: the browser loads UDM from there.
+
+
+Update to a new version
+-----------------------
+Run the new UDM-Setup.exe. Your downloads list and settings are kept.
+Then open chrome://extensions (or brave://extensions) and press the reload arrow on
+"Uniguri Download Manager".
+
+
+Uninstall
+---------
+Windows Settings > Apps > "UDM (Uniguri Download Manager)" > Uninstall,
+or Start menu > UDM > Uninstall UDM.
+It asks if you want to delete the files UDM downloaded, and your history and settings.
+Both are kept if you say No.
+Then remove the extension in chrome://extensions.
+
+
+Something does not work?
+------------------------
+  - No hedgehog icon near the clock: Start menu > UDM > Start UDM downloader.
+  - The extension says the downloader is not reachable: start it as above, wait a few
+    seconds, and try again.
+  - Incognito windows: chrome://extensions > Uniguri Download Manager > Details,
+    turn on "Allow in Incognito".
+  - More help: Start menu > UDM > UDM readme.
+
+
+Credits
+-------
+The hedgehog logo is Uniguri, a character from ZUTOMAYO (ずっと真夜中でいいのに。).
+All rights belong to ZUTOMAYO. This is an unofficial fan project and is not
+affiliated with or endorsed by ZUTOMAYO.
+Official channel: https://www.youtube.com/c/ZUTOMAYO
