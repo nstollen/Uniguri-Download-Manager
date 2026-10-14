@@ -7,6 +7,9 @@ python downloader.py <url>    -> download one file or stream right now (for test
 import atexit
 import base64
 import collections
+import contextlib
+import ctypes
+import email.utils
 import glob
 import hashlib
 import itertools
@@ -14,14 +17,18 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import http.client
 import urllib.error
 import urllib.parse
 import urllib.request
 import winreg
+from ctypes import wintypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import tray
@@ -56,6 +63,8 @@ ACTIVE = ("running", "queued")  # states of a job that is downloading or waiting
 settings_time = 0  # when settings.json was last written, to notice edits made by hand
 settings = {
     "maxJobs": 3, "parts": 8, "speedLimit": 0,
+    # connections to one site, all its downloads together, and per-site exceptions ("example.com = 2", one per line)
+    "siteConnections": 8, "siteLimits": "",
     "folder": "",  # where files are saved, "" = OUT_DIR
     "sortFolders": True,  # put each file in the subfolder that lists its extension, or in "other"
     "folders": {
@@ -78,6 +87,11 @@ settings = {
     # auto clean (days after which history, stats, thumbnails and log lines are deleted, 0 = never),
     # and whether stats remember the site of each download
     "privateMode": False, "autoClean": 0, "statsSites": True,
+    # network: "none" | "windows" (the proxy set in Windows) | "manual" (proxyType "http" | "socks5", host, port,
+    # optional user and password). The password is kept encrypted with Windows DPAPI ("dpapi:" + base64), see dpapi()
+    "proxyMode": "none", "proxyType": "http", "proxyHost": "", "proxyPort": 8080, "proxyUser": "", "proxyPassword": "",
+    # security: scan each finished download with Windows Defender, except those from the trusted sites (one per line)
+    "scanDownloads": True, "trustedSites": "",
 }
 AFTER_DONE = ("nothing", "sleep", "shutdown", "quit")
 AUTO_CLEAN = (0, 7, 30, 90)
@@ -147,6 +161,9 @@ clock = {}  # job id or "all" -> time when the next chunk may be read (this is h
 #   refresh (True when a started direct download failed with 403, 404 or 410: the link can be refreshed)
 #   sha256 (checksum of the finished file, "" until the Checksum button), hashing (percent while it runs, or None)
 #   private (True: never in history.json, stats.json, thumbs or the log; taken off the list once done or canceled)
+#   scan (Windows Defender, after the download): "" (no scan: off, or not finished) | "scanning" | "clean" |
+#     "threat" (the user still has to choose) | "deleted" | "kept" | "trusted" (skipped) | "unavailable" | "failed"
+#   threat (the name Defender gives the threat, or "")
 # "stopped" is a paused stream: ffmpeg cannot pause, so resume starts the stream again.
 jobs = {}
 # job id -> things that are never shown or saved:
@@ -163,7 +180,7 @@ LINK = re.compile(r"\b(?:https?|ftp)://[^\s'\"<>|]+", re.I)
 STAMP = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) ")  # the time at the start of a log line
 # what history.json keeps of each job. Cookies are never written to disk.
 SAVED = ("id", "name", "kind", "url", "referrer", "userAgent", "title", "path", "done", "elapsed", "limit",
-         "notified", "variant", "subtitles", "subFormat", "audioOnly", "refresh", "sha256")
+         "notified", "variant", "subtitles", "subFormat", "audioOnly", "refresh", "sha256", "scan", "threat")
 
 
 def log(text, job=None):
@@ -240,7 +257,10 @@ def load_history():
             job["percent"] = 100.0
         job["limit"] = job["limit"] or 0
         job["subtitles"] = job["subtitles"] or []
-        job.update(refresh=bool(job["refresh"]), sha256=job["sha256"] or "", hashing=None, private=False)
+        job.update(refresh=bool(job["refresh"]), sha256=job["sha256"] or "", hashing=None, private=False,
+                   scan=job["scan"] or "", threat=job["threat"] or "")
+        if job["scan"] == "scanning":  # the downloader was closed during the scan
+            job["scan"] = "failed"
         job["notified"] = job["notified"] is not False  # old news is not announced again
         jobs[job["id"]] = job
         live[job["id"]] = {"stop": "", "proc": None, "cookies": ""}
@@ -364,35 +384,190 @@ def throttle(job, ctl, n):
                 time.sleep(min(0.2, max(0, until - time.time())))
 
 
+# ---- per-site connection limits: every connection of every direct download to one site takes one of the site's
+# slots (siteConnections, or its line in siteLimits). A connection that finds no free slot waits for one. ----
+SLOW_CODES = (429, 503)  # the server asks us to slow down
+SLOW_WAIT = 10  # seconds to wait after a slow down answer without a Retry-After header
+SLOW_KEEP = 600  # seconds a halved site limit is kept after the site's last slow down answer
+SLOW_DOWN = "site asked to slow down"  # job detail while waiting for the site
+DROP = 0.5  # the site got at least this much slower after a connection was added: no more connections for it
+# site -> used (connections open), waiting (connections waiting for a slot), limit (halved limit, None = the setting),
+#   hit (time of the last slow down answer), until (no new connection before this time),
+#   cap (most connections allowed because more made it slower, None = no cap),
+#   bytes (read from the site so far), samples / sampled / speed (bytes per second over the last few seconds),
+#   check (after a connection was added: {at, speed, used} to compare the speed with, or None)
+sites = {}
+site_lock = threading.Condition()  # held while sites changes, waited on for a free slot
+
+
+def site_limits_of(text):
+    """Per-site overrides, "x.com = 2" one per line -> {"x.com": 2}."""
+    found = {}
+    for line in text.splitlines():
+        site, _, number = line.partition("=")
+        site = re.sub(r"^www\.", "", clean_host(site).lower())
+        if site and number.strip().isdigit():
+            found[site] = min(max(int(number), 1), 32)
+    return found
+
+
+def site_limits():
+    """The per-site overrides from the settings."""
+    return site_limits_of(settings["siteLimits"])
+
+
+def site_key(url):
+    """The site whose slots a request to url uses: the override it falls under (subdomains too), else its host."""
+    host = re.sub(r"^www\.", "", (urllib.parse.urlsplit(url).hostname or "").lower())
+    for site in sorted(site_limits(), key=len, reverse=True):  # "a.x.com" before "x.com"
+        if in_site(host, site):
+            return site
+    return host
+
+
+def site_allowed(site, s):
+    """How many connections the site may have now: the setting, halved after slow downs, capped after a speed drop."""
+    allowed = site_limits().get(site, settings["siteConnections"])
+    if s["limit"] and time.time() - s["hit"] > SLOW_KEEP:
+        s["limit"] = None  # the site has not complained for a while
+    return min(allowed, s["limit"] or allowed, s["cap"] or allowed)
+
+
+def site_slowed(site):
+    """True while the site asked us to slow down and we are still waiting for it."""
+    with site_lock:
+        return site in sites and time.time() < sites[site]["until"]
+
+
+def site_free(site):
+    """True when a new connection to the site could start right now."""
+    with site_lock:
+        s = sites.get(site)
+        return not s or (time.time() >= s["until"] and s["used"] + s["waiting"] < site_allowed(site, s))
+
+
+@contextlib.contextmanager
+def site_slot(job, ctl):
+    """Hold one of the site's connection slots, waiting until one is free and any slow down wait is over.
+    Gives the site, or None when the job was paused or canceled while it waited."""
+    site = site_key(job["url"])
+    with site_lock:
+        s = sites.setdefault(site, {"used": 0, "waiting": 0, "limit": None, "hit": 0, "until": 0, "cap": None,
+                                    "bytes": 0, "samples": [], "sampled": 0, "speed": 0.0, "check": None})
+        s["waiting"] += 1
+        while not ctl["stop"] and (time.time() < s["until"] or s["used"] >= site_allowed(site, s)):
+            site_lock.wait(0.5)
+        s["waiting"] -= 1
+        got = not ctl["stop"]
+        if got:
+            now = time.time()
+            # a connection is added while the site is busy: see in a few seconds whether that made it slower
+            busy = s["samples"] and now - s["samples"][0][0] >= 2 and now - s["sampled"] < 1 and s["speed"] > 0
+            if busy and s["used"] and not s["check"] and not s["cap"]:
+                s["check"] = {"at": now, "speed": s["speed"], "used": s["used"]}
+            s["used"] += 1
+    if not got:
+        yield None
+        return
+    try:
+        yield site
+    finally:
+        with site_lock:
+            s["used"] -= 1
+            if not s["used"] and not s["waiting"]:  # the site is idle: its next download measures speed afresh
+                s.update(cap=None, check=None, samples=[], sampled=0, speed=0.0)
+            site_lock.notify_all()
+
+
+def site_count(site, n, job):
+    """Count n bytes read from the site. Every half second the site's speed is updated, and a few seconds after a
+    connection was added it is compared with the speed before: much slower means the site gets no more connections."""
+    with site_lock:
+        s = sites[site]
+        s["bytes"] += n
+        now = time.time()
+        if now - s["sampled"] < 0.5:
+            return
+        s["sampled"] = now
+        s["speed"] = rate(s["samples"], now, s["bytes"])
+        check = s["check"]
+        if check and now - check["at"] > WINDOW + 1:  # the speed is all from after the new connection now
+            s["check"] = None
+            # fewer connections than before (a part finished) or a slow down wait also make it slower: not counted
+            if s["used"] > check["used"] and s["until"] < check["at"] and s["speed"] < check["speed"] * DROP:
+                s["cap"] = check["used"]
+                log("  %s got slower with more connections (%.0f -> %.0f KB/s): no more than %d connections"
+                    % (site, check["speed"] / 1024, s["speed"] / 1024, s["cap"]), job)
+
+
+def retry_after(value):
+    """Seconds from a Retry-After header ("120" or an http date), SLOW_WAIT when there is none or it makes no sense."""
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+    try:
+        return max(0.0, email.utils.parsedate_to_datetime(value).timestamp() - time.time())
+    except (TypeError, ValueError, IndexError):
+        return SLOW_WAIT
+
+
+def slow_down(site, error, job):
+    """The site answered 429 or 503: halve its connection limit and wait for its Retry-After (or SLOW_WAIT).
+    The parts that get the same answer at the same time halve it only once."""
+    wait = retry_after(error.headers.get("Retry-After") if error.headers else None)
+    with site_lock:
+        s = sites[site]
+        now = time.time()
+        if now >= s["until"]:
+            s["limit"] = max(1, site_allowed(site, s) // 2)
+            s["hit"] = now
+            log("  %s asked to slow down (HTTP %d): %d connections now, waiting %.0fs"
+                % (site, error.code, s["limit"], wait), job)
+        s["until"] = max(s["until"], now + wait)
+    job["detail"] = SLOW_DOWN
+
+
 def fetch_part(job, headers, path, part, ctl, guard):
     """Append bytes to one part file until its range is complete or the job is told to stop.
     The end of the range can move closer while this runs (dynamic segmentation): guard is held
-    while it changes, and while bytes are counted, so no byte past the new end is ever written."""
+    while it changes, and while bytes are counted, so no byte past the new end is ever written.
+    Each try holds one of the site's connection slots; a slow down answer (429, 503) is not a failed try."""
     left = lambda: part["end"] - part["start"] + 1 - part["done"]  # noqa: E731
-    for attempt in range(1 + RETRIES):
-        if left() <= 0 or ctl["stop"]:
-            return
-        try:
-            rng = "bytes=%d-%d" % (part["start"] + part["done"], part["end"])
-            req = urllib.request.Request(job["url"], headers={**headers, "Range": rng})
-            with urllib.request.urlopen(req, timeout=30) as r, open(path, "ab") as f:
-                if r.status != 206:
-                    raise IOError("server ignored the range request (status %d)" % r.status)
-                while left() > 0 and not ctl["stop"]:
-                    # small reads while a speed limit is on, so the limit is smooth
-                    chunk = 8192 if job["limit"] or current_limit() else CHUNK
-                    data = r.read(min(chunk, left()))
-                    if not data:
-                        break
-                    with guard:
-                        data = data[:left()]  # the part may have been split while we were reading
-                        f.write(data)
-                        part["done"] += len(data)
-                    throttle(job, ctl, len(data))
-        except Exception as e:
-            ctl["error"] = str(e) or repr(e)
-            ctl["code"] = getattr(e, "code", None)  # the http status, for Refresh link
-            log("  part at byte %d failed (try %d of %d): %s" % (part["start"], attempt + 1, 1 + RETRIES, e), job)
+    attempt = 0
+    while attempt <= RETRIES and left() > 0 and not ctl["stop"]:
+        failed = False
+        with site_slot(job, ctl) as site:
+            if site is None:
+                return
+            try:
+                rng = "bytes=%d-%d" % (part["start"] + part["done"], part["end"])
+                req = urllib.request.Request(job["url"], headers={**headers, "Range": rng})
+                with urllib.request.urlopen(req, timeout=30) as r, open(path, "ab") as f:
+                    if r.status != 206:
+                        raise IOError("server ignored the range request (status %d)" % r.status)
+                    while left() > 0 and not ctl["stop"]:
+                        # small reads while a speed limit is on, so the limit is smooth
+                        chunk = 8192 if job["limit"] or current_limit() else CHUNK
+                        data = r.read(min(chunk, left()))
+                        if not data:
+                            break
+                        with guard:
+                            data = data[:left()]  # the part may have been split while we were reading
+                            f.write(data)
+                            part["done"] += len(data)
+                        site_count(site, len(data), job)
+                        throttle(job, ctl, len(data))
+            except Exception as e:
+                if getattr(e, "code", None) in SLOW_CODES:
+                    slow_down(site, e, job)
+                    continue  # wait for the site (in site_slot), then the same try again
+                ctl["error"] = str(e) or repr(e)
+                ctl["code"] = getattr(e, "code", None)  # the http status, for Refresh link
+                log("  part at byte %d failed (try %d of %d): %s" % (part["start"], attempt + 1, 1 + RETRIES, e), job)
+                failed = True
+        attempt += 1
+        if failed:
             time.sleep(1)
 
 
@@ -420,22 +595,31 @@ def download(job, ctl):
     # A 206 reply proves ranges work (same meaning as Accept-Ranges: bytes),
     # and Content-Range carries the full length.
     size = 0
-    try:
-        probe = urllib.request.Request(url, headers={**headers, "Range": "bytes=0-0"})
-        with urllib.request.urlopen(probe, timeout=30) as r:
-            if r.status == 206:
-                size = int(r.headers["Content-Range"].split("/")[1])
-            else:
-                log("no range support (Accept-Ranges: %s, Content-Length: %s)"
-                    % (r.headers.get("Accept-Ranges"), r.headers.get("Content-Length")), job)
-    except urllib.error.HTTPError as e:
-        ctl["code"] = e.code
-        if job["done"]:  # already started: the saved parts are worth more than a fresh single download
-            return "%s (the link may have expired)" % e
-        log("server refused the range check (HTTP %d), trying a single download" % e.code, job)
-    except Exception as e:
-        # network trouble, not a "no ranges" answer: stop here so saved parts stay resumable
-        return "cannot reach server: %s. Resume to try again." % e
+    while True:  # again after a slow down answer
+        with site_slot(job, ctl) as site:
+            if site is None:
+                return "stopped"
+            job["detail"] = ""
+            try:
+                probe = urllib.request.Request(url, headers={**headers, "Range": "bytes=0-0"})
+                with urllib.request.urlopen(probe, timeout=30) as r:
+                    if r.status == 206:
+                        size = int(r.headers["Content-Range"].split("/")[1])
+                    else:
+                        log("no range support (Accept-Ranges: %s, Content-Length: %s)"
+                            % (r.headers.get("Accept-Ranges"), r.headers.get("Content-Length")), job)
+            except urllib.error.HTTPError as e:
+                if e.code in SLOW_CODES:
+                    slow_down(site, e, job)
+                    continue
+                ctl["code"] = e.code
+                if job["done"]:  # already started: the saved parts are worth more than a fresh single download
+                    return "%s (the link may have expired)" % e
+                log("server refused the range check (HTTP %d), trying a single download" % e.code, job)
+            except Exception as e:
+                # network trouble, not a "no ranges" answer: stop here so saved parts stay resumable
+                return "cannot reach server: %s. Resume to try again." % e
+        break
 
     def no_room(need):
         """An error message when the disk cannot take `need` more bytes, else None."""
@@ -447,26 +631,36 @@ def download(job, ctl):
     # ---- no ranges: normal single download (pause works, but resume starts it again) ----
     if size < parts:
         log("single download: %s" % name, job)
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=30) as r, open(target + ".part", "wb") as f:
-                total = int(r.headers.get("Content-Length") or 0)
-                if no_room(total):
-                    return no_room(total)
-                done = last = 0
-                while not ctl["stop"]:
-                    data = r.read(8192 if job["limit"] or current_limit() else CHUNK)
-                    if not data:
-                        break
-                    f.write(data)
-                    done += len(data)
-                    throttle(job, ctl, len(data))
-                    if time.time() - last >= 0.5:
-                        report(done, total)
-                        last = time.time()
-        except Exception as e:
-            ctl["code"] = getattr(e, "code", None)
-            return str(e)
+        while True:  # again after a slow down answer
+            with site_slot(job, ctl) as site:
+                if site is None:
+                    return "stopped"
+                job["detail"] = ""
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=30) as r, open(target + ".part", "wb") as f:
+                        total = int(r.headers.get("Content-Length") or 0)
+                        if no_room(total):
+                            return no_room(total)
+                        done = last = 0
+                        while not ctl["stop"]:
+                            data = r.read(8192 if job["limit"] or current_limit() else CHUNK)
+                            if not data:
+                                break
+                            f.write(data)
+                            done += len(data)
+                            site_count(site, len(data), job)
+                            throttle(job, ctl, len(data))
+                            if time.time() - last >= 0.5:
+                                report(done, total)
+                                last = time.time()
+                except Exception as e:
+                    if getattr(e, "code", None) in SLOW_CODES:
+                        slow_down(site, e, job)
+                        continue
+                    ctl["code"] = getattr(e, "code", None)
+                    return str(e)
+            break
         if ctl["stop"]:
             return "stopped"
         os.replace(target + ".part", target)
@@ -519,11 +713,12 @@ def download(job, ctl):
         # Dynamic segmentation: a connection finished its part early, so the part that will take longest
         # is split in half and a new connection takes the second half. At most `parts` connections run,
         # and a part that ended with an error stops the splitting (the job is going to fail anyway).
+        # No split while the site has no free connection: the new half would only wait for one.
         now = time.time()
         rates = [rate(speeds[i], now, p["done"]) for i, p in enumerate(state["parts"])]
         failed_part = any(not t.is_alive() and p["done"] < p["end"] - p["start"] + 1
                           for t, p in zip(threads, state["parts"]))
-        if running and len(running) < parts and not ctl["stop"] and not failed_part:
+        if running and len(running) < parts and not ctl["stop"] and not failed_part and site_free(site_key(url)):
             with guard:
                 left = {i: state["parts"][i]["end"] - state["parts"][i]["start"] + 1 - state["parts"][i]["done"]
                         for i in running}
@@ -546,7 +741,7 @@ def download(job, ctl):
         os.replace(state_path + ".tmp", state_path)
         done = sum(p["done"] for p in state["parts"])
         report(done, size)
-        job["detail"] = "%.1f%%" % job["percent"]
+        job["detail"] = SLOW_DOWN if site_slowed(site_key(url)) else "%.1f%%" % job["percent"]
         if time.time() - last_print > 2 or not alive:
             log("  %s  %5.1f%%  %d / %d" % (name, 100.0 * done / size, done, size), job)
             last_print = time.time()
@@ -569,6 +764,324 @@ def download(job, ctl):
     return None
 
 
+# ---- proxy: settings page, Network. Every urllib request (direct downloads, playlists, subtitles) goes through
+# the opener installed by use_proxy(); ffmpeg and ffprobe get the proxy with -http_proxy, see ffmpeg_proxy() ----
+PROXY_MODES = ("none", "windows", "manual")
+PROXY_TYPES = ("http", "socks5")
+LOOPBACK = ("127.0.0.1", "localhost", "::1")  # never through a proxy
+PROXY_TEST = os.environ.get("UDM_PROXY_TEST") or "http://www.msftconnecttest.com/connecttest.txt"  # what Windows itself asks
+NO_SOCKS_FFMPEG = "ffmpeg cannot use a SOCKS5 proxy, so streams connect directly"
+SOCKS_ERRORS = {1: "general failure", 2: "not allowed by its rules", 3: "network unreachable", 4: "host unreachable",
+                5: "connection refused", 6: "time to live expired", 7: "command not supported", 8: "address type not supported"}
+windows_proxy = None  # the Windows proxy settings the installed opener was built with (mode "windows")
+
+
+class Blob(ctypes.Structure):
+    _fields_ = [("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_char))]
+
+
+def dpapi(data, protect):
+    """Windows DPAPI: encrypt (protect=True) or decrypt bytes. Only the same Windows user on this PC can decrypt."""
+    crypt32, kernel32 = ctypes.WinDLL("crypt32"), ctypes.WinDLL("kernel32")
+    buf = ctypes.create_string_buffer(data, len(data))
+    src, out = Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), Blob()
+    call = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    if not call(ctypes.byref(src), None, None, None, None, 1, ctypes.byref(out)):  # 1 = no UI
+        raise OSError("DPAPI: %s" % ctypes.FormatError().strip())
+    try:
+        return ctypes.string_at(out.data, out.size)
+    finally:
+        kernel32.LocalFree(ctypes.cast(out.data, ctypes.c_void_p))
+
+
+def protect(password):
+    """A proxy password as settings.json keeps it."""
+    return "dpapi:" + base64.b64encode(dpapi(password.encode("utf-8"), True)).decode() if password else ""
+
+
+def proxy_password():
+    """The saved proxy password in plain text ("" when there is none, or it cannot be read: another user or PC)."""
+    saved = settings["proxyPassword"]
+    if not saved.startswith("dpapi:"):
+        return ""
+    try:
+        return dpapi(base64.b64decode(saved[6:]), False).decode("utf-8")
+    except Exception as e:
+        log("the saved proxy password cannot be read (%s); type it again on the settings page" % e)
+        return ""
+
+
+def public_settings():
+    """The settings for the extension pages and backups: never the password, only whether one is saved."""
+    return {**settings, "proxyPassword": "", "proxyPasswordSet": bool(settings["proxyPassword"])}
+
+
+def proxy_conf(form=None):
+    """The proxy as a dict: mode, type, host, port, user, password. From the settings, or from the settings
+    page's Test button (form: what is typed there; an empty password means the saved one)."""
+    s = {**settings, **(form or {})}
+    password = (form or {}).get("proxyPassword") or proxy_password()
+    return {"mode": s["proxyMode"], "type": s["proxyType"], "host": clean_host(s["proxyHost"]),
+            "port": int(s["proxyPort"] or 0), "user": s["proxyUser"], "password": password if s["proxyUser"] else ""}
+
+
+def clean_host(text):
+    """ "http://proxy.lan:8080/" -> "proxy.lan" (the port has its own box)."""
+    host = re.sub(r"^[a-z0-9]+://", "", str(text or "").strip(), flags=re.I).split("/")[0]
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
+def socks_connect(conf, host, port, timeout):
+    """A connection to host:port through a SOCKS5 proxy (RFC 1928, login RFC 1929). The proxy looks up the
+    name, so DNS goes through it too. This PC itself is reached directly."""
+    if timeout is socket._GLOBAL_DEFAULT_TIMEOUT:
+        timeout = None
+    if host in LOOPBACK:
+        return socket.create_connection((host, port), timeout)
+    sock = socket.create_connection((conf["host"], conf["port"]), timeout)
+
+    def read(n):
+        data = b""
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            if not chunk:
+                raise OSError("the SOCKS5 proxy closed the connection")
+            data += chunk
+        return data
+
+    try:
+        user, password = conf["user"].encode("utf-8"), conf["password"].encode("utf-8")
+        sock.sendall(b"\x05\x02\x00\x02" if user else b"\x05\x01\x00")  # no login, or user name and password
+        version, method = read(2)
+        if version != 5:
+            raise OSError("this is not a SOCKS5 proxy")
+        if method == 2:
+            sock.sendall(b"\x01" + bytes([len(user)]) + user + bytes([len(password)]) + password)
+            if read(2)[1] != 0:
+                raise OSError("the SOCKS5 proxy did not accept the user name and password")
+        elif method != 0:
+            raise OSError("the SOCKS5 proxy needs a user name and password" if not user
+                          else "the SOCKS5 proxy accepts none of the login methods UDM has")
+        name = host.encode("idna")
+        sock.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name + int(port).to_bytes(2, "big"))
+        _, reply, _, kind = read(4)
+        if reply:
+            raise OSError("SOCKS5 proxy: %s" % SOCKS_ERRORS.get(reply, "error %d" % reply))
+        read({1: 4, 4: 16}.get(kind) or read(1)[0])  # the address the proxy used, then its port
+        read(2)
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
+def socks_connection(base, conf):
+    """http.client's connection class, connecting through the SOCKS5 proxy (https is then wrapped as usual)."""
+    class Connection(base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._create_connection = lambda address, timeout=None, source_address=None: \
+                socks_connect(conf, address[0], address[1], timeout)
+    return Connection
+
+
+class SocksHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, conf):
+        super().__init__()
+        self.conf = conf
+
+    def http_open(self, req):
+        return self.do_open(socks_connection(http.client.HTTPConnection, self.conf), req)
+
+
+class SocksHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, conf):
+        super().__init__()
+        self.conf = conf
+
+    def https_open(self, req):
+        return self.do_open(socks_connection(http.client.HTTPSConnection, self.conf), req, context=self._context)
+
+
+class HTTPProxyHandler(urllib.request.BaseHandler):
+    """Manual HTTP proxy: every request except to this PC goes to it (https through CONNECT)."""
+    handler_order = 100  # before the http and https handlers, like urllib's own ProxyHandler
+
+    def __init__(self, conf):
+        self.hostport = "[%s]:%d" % (conf["host"], conf["port"]) if ":" in conf["host"] else "%s:%d" % (conf["host"], conf["port"])
+        login = "%s:%s" % (conf["user"], conf["password"])
+        self.auth = "Basic " + base64.b64encode(login.encode("utf-8")).decode() if conf["user"] else ""
+
+    def http_open(self, req):
+        if urllib.parse.urlsplit(req.full_url).hostname in LOOPBACK:
+            return None
+        if self.auth:
+            req.add_header("Proxy-authorization", self.auth)
+        req.set_proxy(self.hostport, "http")
+        return None  # the http or https handler sends it
+
+    https_open = http_open
+
+
+def proxy_opener(conf):
+    """A urllib opener for this proxy. ProxyHandler({}) keeps urllib from using proxies on its own."""
+    direct = urllib.request.ProxyHandler({})
+    if conf["mode"] == "windows":
+        return urllib.request.build_opener(urllib.request.ProxyHandler(urllib.request.getproxies_registry()))
+    if conf["mode"] == "manual" and conf["type"] == "socks5":
+        return urllib.request.build_opener(direct, SocksHTTPHandler(conf), SocksHTTPSHandler(conf))
+    if conf["mode"] == "manual":
+        return urllib.request.build_opener(direct, HTTPProxyHandler(conf))
+    return urllib.request.build_opener(direct)
+
+
+def use_proxy():
+    """Install the opener for the proxy settings. Called when they change, and by tick() for the Windows proxy."""
+    global windows_proxy
+    windows_proxy = urllib.request.getproxies_registry() if settings["proxyMode"] == "windows" else None
+    urllib.request.install_opener(proxy_opener(proxy_conf()))
+
+
+def proxy_text(conf):
+    """ "socks5 proxy.lan:1080" for the log and the Test button."""
+    if conf["mode"] == "windows":
+        proxies = urllib.request.getproxies_registry()
+        return "the Windows proxy (%s)" % (proxies.get("https") or proxies.get("http") or "none set in Windows")
+    return "%s proxy %s:%d" % (conf["type"], conf["host"], conf["port"]) if conf["mode"] == "manual" else "no proxy"
+
+
+def test_proxy(form):
+    """Settings page, Test: one small request through the proxy typed there. Returns the reply for the page."""
+    conf = proxy_conf({k: form[k] for k in ("proxyMode", "proxyType", "proxyHost", "proxyUser", "proxyPassword")
+                       if isinstance(form.get(k), str)} | ({"proxyPort": form["proxyPort"]} if type(form.get("proxyPort")) is int else {}))
+    if conf["mode"] == "manual" and not (conf["host"] and 0 < conf["port"] < 65536):
+        return {"ok": False, "error": "type the proxy's address and port first"}
+    started = time.time()
+    try:
+        req = urllib.request.Request(PROXY_TEST, headers={"User-Agent": "udm/1.0"})
+        with proxy_opener(conf).open(req, timeout=15) as r:
+            r.read(4096)
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": "the proxy wants a user name and password (407)" if e.code == 407
+                else "the test page answered %d %s" % (e.code, e.reason)}
+    except Exception as e:
+        reason = getattr(e, "reason", None) or e
+        return {"ok": False, "error": str(reason) or repr(reason)}
+    return {"ok": True, "ms": round((time.time() - started) * 1000), "via": proxy_text(conf)}
+
+
+def ffmpeg_env():
+    """ffmpeg would take http_proxy from the environment by itself; UDM's proxy setting decides instead."""
+    return {k: v for k, v in os.environ.items() if k.lower() not in ("http_proxy", "https_proxy", "no_proxy")}
+
+
+def ffmpeg_proxy(url):
+    """The -http_proxy value for ffmpeg and ffprobe ("" = none), and a note when the proxy cannot be used."""
+    host, scheme = urllib.parse.urlsplit(url).hostname or "", urllib.parse.urlsplit(url).scheme
+    if host in LOOPBACK:
+        return "", ""
+    if settings["proxyMode"] == "manual":
+        conf = proxy_conf()
+        if conf["type"] == "socks5":
+            return "", NO_SOCKS_FFMPEG
+        login = "%s:%s@" % (urllib.parse.quote(conf["user"], safe=""), urllib.parse.quote(conf["password"], safe="")) if conf["user"] else ""
+        return "http://%s%s:%d" % (login, "[%s]" % conf["host"] if ":" in conf["host"] else conf["host"], conf["port"]), ""
+    if settings["proxyMode"] == "windows":
+        proxy = urllib.request.getproxies_registry().get(scheme, "")
+        if not proxy or urllib.request.proxy_bypass_registry(host):
+            return "", ""
+        if proxy.lower().startswith("socks"):
+            return "", NO_SOCKS_FFMPEG
+        return proxy if "://" in proxy else "http://" + proxy, ""
+    return "", ""
+
+
+# ---- virus scan: Windows Defender's command line scanner, on each finished download ----
+defender = {"exe": "", "available": None, "reason": "", "checked": 0}  # see check_defender()
+
+
+def find_mpcmdrun():
+    """Defender's command line scanner: the newest one in its platform folder, else the old place."""
+    if os.environ.get("UDM_MPCMDRUN"):  # only for testing: a stand-in scanner
+        return os.environ["UDM_MPCMDRUN"]
+    platform = os.path.join(os.environ.get("ProgramData") or r"C:\ProgramData", "Microsoft", "Windows Defender", "Platform")
+    found = sorted(glob.glob(os.path.join(glob.escape(platform), "*", "MpCmdRun.exe")),
+                   key=lambda x: [int(n) for n in re.findall(r"\d+", os.path.basename(os.path.dirname(x)))])
+    old = os.path.join(os.environ.get("ProgramFiles") or r"C:\Program Files", "Windows Defender", "MpCmdRun.exe")
+    return found[-1] if found else old if os.path.exists(old) else ""
+
+
+def mpcmdrun(exe, path):
+    """Scan one file. -DisableRemediation: Defender only reports, so the user decides. Its exit code is 2 for a
+    threat and for an error alike, so its output decides. Returns ("clean" | "threat" | "failed", threat name or error)."""
+    try:
+        out = subprocess.run([exe, "-Scan", "-ScanType", "3", "-File", path, "-DisableRemediation"], capture_output=True,
+                             text=True, errors="replace", timeout=1800, stdin=subprocess.DEVNULL,
+                             creationflags=subprocess.CREATE_NO_WINDOW)
+    except Exception as e:
+        return "failed", str(e) or repr(e)
+    text = out.stdout + out.stderr
+    found = re.search(r"found (\d+) threats", text)
+    name = re.search(r"^\s*Threat\s*:\s*(.+?)\s*$", text, re.M)
+    if found and int(found.group(1)) > 0 or name:
+        return "threat", name.group(1) if name else ""
+    if "found no threats" in text:
+        return "clean", ""
+    hr = re.search(r"hr = (0x[0-9a-f]+)", text, re.I)
+    return "failed", "MpCmdRun failed (%s)" % (hr.group(1) if hr else "exit %d" % out.returncode)
+
+
+def check_defender(again=False):
+    """Can Defender scan? Not when it is missing, or turned off because another antivirus is installed. Found out
+    with a test scan of a small file, at most every 10 minutes (again=True: now, for the settings page)."""
+    if defender["available"] is not None and not again and time.time() - defender["checked"] < 600:
+        return defender
+    exe, available, reason = find_mpcmdrun(), False, ""
+    if not exe:
+        reason = "Windows Defender is not installed"
+    elif not os.environ.get("UDM_MPCMDRUN") and not re.search(r"STATE\s*:\s*4\b", subprocess.run(
+            ["sc", "query", "WinDefend"], capture_output=True, text=True, errors="replace", stdin=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW).stdout):
+        reason = "Windows Defender is turned off. Another antivirus may be installed"
+    else:
+        probe = os.path.join(tempfile.gettempdir(), "udm-scan-check.txt")
+        with open(probe, "w") as f:
+            f.write("UDM checks that Windows Defender can scan a file.")
+        result, detail = mpcmdrun(exe, probe)
+        os.remove(probe)
+        available = result == "clean"
+        reason = "" if available else "Windows Defender did not scan a test file: %s" % (detail or result)
+    if available != defender["available"]:
+        log("virus scan: %s" % ("Windows Defender is ready" if available else reason))
+    defender.update(exe=exe, available=available, reason=reason, checked=time.time())
+    return defender
+
+
+def trusted(job):
+    """Is the download's page or file on one of the trusted sites (or a subdomain)?"""
+    sites = [re.sub(r"^www\.", "", clean_host(x).lower()) for x in settings["trustedSites"].replace(",", " ").split()]
+    hosts = [(urllib.parse.urlsplit(job.get(k) or "").hostname or "").lower() for k in ("referrer", "url")]
+    return any(in_site(host, site) for host in hosts for site in sites)
+
+
+def scan(job):
+    """A download just finished: let Defender scan the file (unless the scan is off, the site is trusted, or
+    Defender cannot scan). Sets job["scan"] and job["threat"]."""
+    job["scan"], job["threat"] = "", ""
+    if not settings["scanDownloads"]:
+        return
+    if trusted(job):
+        job["scan"] = "trusted"
+        return
+    if not check_defender()["available"]:
+        job["scan"] = "unavailable"
+        return
+    job.update(scan="scanning", speed=0, eta=None)
+    result, detail = mpcmdrun(defender["exe"], job["path"])
+    job.update(scan=result, threat=detail if result == "threat" else "")
+    log("scan of %s: %s%s" % (job["name"], result, ": " + detail if detail else ""), job)
+
+
 def stream_duration(ffmpeg, url, headers, job=None):
     """Total length of a stream in seconds, or 0 when it cannot be found (for example a live stream).
     job: for the log only (a private one is not logged)."""
@@ -577,12 +1090,14 @@ def stream_duration(ffmpeg, url, headers, job=None):
     if os.path.exists(probe):
         try:
             cmd = [probe, "-v", "error", "-user_agent", headers["User-Agent"]]
+            if ffmpeg_proxy(url)[0]:
+                cmd += ["-http_proxy", ffmpeg_proxy(url)[0]]
             extra = "".join("%s: %s\r\n" % kv for kv in headers.items() if kv[0] != "User-Agent")
             if extra:
                 cmd += ["-headers", extra]
             cmd += ["-show_entries", "format=duration", "-of", "csv=p=0", url]
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
-                                 creationflags=subprocess.CREATE_NO_WINDOW).stdout
+                                 env=ffmpeg_env(), creationflags=subprocess.CREATE_NO_WINDOW).stdout
             return float(out.strip())
         except Exception as e:
             log("  ffprobe gave no duration (%s), reading the playlist instead" % e, job)
@@ -775,6 +1290,11 @@ def stream_once(job, ctl):
     # ffmpeg itself reconnects for up to about 10 seconds when the server answers 5xx or the network drops
     cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
             "-reconnect_on_http_error", "5xx", "-reconnect_delay_max", "10"]
+    proxy, note = ffmpeg_proxy(job["url"])
+    if proxy:
+        cmd += ["-http_proxy", proxy]
+    elif note:
+        log("  %s: %s" % (name, note), job)
     cmd += ["-i", job["url"]]
     audio = job.get("audioOnly")
     if job.get("variant") is not None:  # the quality picked in the popup: ffmpeg's program N is quality N
@@ -794,7 +1314,7 @@ def stream_once(job, ctl):
     # ---- process: run ffmpeg, read its progress lines, keep anything else as the error ----
     proc = ctl["proc"] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                           stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
-                                          creationflags=subprocess.CREATE_NO_WINDOW)
+                                          env=ffmpeg_env(), creationflags=subprocess.CREATE_NO_WINDOW)
     if ctl["stop"]:  # stop or cancel arrived while ffmpeg was starting
         proc.kill()
     errors = []
@@ -847,7 +1367,7 @@ def run(job_id):
     is_stream = job["kind"] == "stream"
     if is_stream:  # a stream always starts again from the beginning
         job.update(done=0, total=None, percent=None, elapsed=0, position=0)
-    job.update(detail="", speed=0, eta=None, finished=None, notified=False, refresh=False)
+    job.update(detail="", speed=0, eta=None, finished=None, notified=False, refresh=False, scan="", threat="")
     ctl["error"], ctl["code"] = "", None
     started = time.time() - job["elapsed"]
     try:
@@ -863,6 +1383,8 @@ def run(job_id):
                 job["detail"] = save_subtitles(job, ctl)
             elif not error:
                 job["detail"] = ""
+            if not error:
+                scan(job)
     except Exception as e:
         error = str(e) or repr(e)
 
@@ -928,7 +1450,7 @@ def forget_private(job_id):
     """A private job that is done or canceled leaves the list (a failed one stays, in memory only, for Retry)."""
     with lock:
         job = jobs.get(job_id)
-        if job and job["private"] and job["state"] in ("done", "canceled"):
+        if job and job["private"] and job["state"] in ("done", "canceled") and job["scan"] != "threat":
             del jobs[job_id], live[job_id]
 
 
@@ -1008,7 +1530,7 @@ def add(msg):
                         "speed": 0, "eta": None, "elapsed": 0, "estimate": is_stream, "position": 0, "notified": False,
                         "added": time.time(), "finished": None, "variant": variant, "subtitles": subtitles,
                         "subFormat": "srt" if msg.get("subFormat") == "srt" else "vtt", "audioOnly": audio,
-                        "refresh": False, "sha256": "", "hashing": None, "private": private}
+                        "refresh": False, "sha256": "", "hashing": None, "private": private, "scan": "", "threat": ""}
         live[job_id] = {"stop": "", "proc": None, "cookies": msg.get("cookies", "")}
         job = jobs[job_id]
         log("job %s: %s from %s%s" % (job_id, name, urllib.parse.urlsplit(url).hostname or "?",
@@ -1030,8 +1552,25 @@ def control(msg):
         if not job:
             return "no such job"
         state = job["state"]
+        if action == "threat":  # delete or keep a file Defender found a threat in
+            if job["scan"] != "threat":
+                return "there is no threat to decide on"
+            if msg.get("choice") == "delete":
+                try:
+                    if os.path.exists(job["path"]):
+                        os.remove(job["path"])
+                except OSError as e:
+                    return "could not delete the file: %s" % (e.strerror or e)
+                remove_thumbnail(job_id)
+            job["scan"] = "deleted" if msg.get("choice") == "delete" else "kept"
+            log("threat in %s: file %s" % (job["name"], job["scan"]), job)
+            save_history()
+            forget_private(job_id)
+            return None
         if action == "open":
             # open the finished file, or show where it is (or will be) in Explorer
+            if not msg.get("folder") and job["scan"] == "threat":
+                return "Windows Defender found a threat in this file. Delete it or keep it first."
             if not msg.get("folder"):
                 if state != "done" or not os.path.isfile(job["path"]):
                     return "the file is not there: %s" % job["path"]
@@ -1178,6 +1717,8 @@ def hash_file(job_id):
 def thumbnail(job_id):
     """Manager page: a small picture of a finished video, made with ffmpeg once and kept in the thumbs
     folder next to history.json. Returns it as a data: url (extension pages cannot read files), or None."""
+    if jobs.get(job_id, {}).get("scan") in ("threat", "deleted"):  # never open a file Defender warned about
+        return None
     # ---- input: a finished video that is still on disk ----
     job = jobs.get(job_id)
     if not job or job["state"] != "done" or job["private"] or not os.path.isfile(job["path"]):
@@ -1312,7 +1853,7 @@ def import_backup(msg):
         if not good:
             return "stats line %d of the backup is broken; nothing was changed" % n
     # private mode stays as it is now: a backup made while it was on does not switch it on here
-    error = change_settings({k: v for k, v in new_settings.items() if k != "privateMode"})
+    error = change_settings({k: v for k, v in new_settings.items() if k not in ("privateMode", "proxyPassword")})
     if error:
         return error
 
@@ -1508,6 +2049,9 @@ def tick():
     cleaned = None  # (day, setting) of the last auto clean
     while True:
         load_settings()
+        if settings["proxyMode"] == "windows" and urllib.request.getproxies_registry() != windows_proxy:
+            use_proxy()
+            log("network: the Windows proxy changed, now %s" % proxy_text(proxy_conf()))
         if (time.strftime("%Y-%m-%d"), settings["autoClean"]) != cleaned:
             cleaned = (time.strftime("%Y-%m-%d"), settings["autoClean"])
             try:
@@ -1529,6 +2073,13 @@ def tick():
 def change_settings(new, save=True):
     """Take over settings from the extension or from settings.json. Returns an error message, or None."""
     global settings_time
+    merged = {**settings, **{k: v for k, v in new.items() if k in settings and type(v) is type(settings[k])}}
+    if merged["proxyMode"] not in PROXY_MODES:
+        return "Proxy must be one of: %s" % ", ".join(PROXY_MODES)
+    if merged["proxyType"] not in PROXY_TYPES:
+        return "Proxy type must be one of: %s" % ", ".join(PROXY_TYPES)
+    if merged["proxyMode"] == "manual" and not (clean_host(merged["proxyHost"]) and 0 < merged["proxyPort"] < 65536):
+        return "a manual proxy needs an address and a port from 1 to 65535"
     for key, value in new.items():
         if key not in settings or type(value) is not type(settings[key]):
             continue  # unknown name or wrong kind of value
@@ -1543,10 +2094,21 @@ def change_settings(new, save=True):
             return "a time must look like 14:30, not %s" % value
         if key == "autoClean" and value not in AUTO_CLEAN:
             return "Auto clean must be one of: %s days" % ", ".join(map(str, AUTO_CLEAN))
-        if key in ("maxJobs", "parts"):
+        if key in ("maxJobs", "parts", "siteConnections"):
             value = min(max(value, 1), 32)
+        if key == "siteLimits":
+            for line in filter(str.strip, value.splitlines()):
+                site, equals, number = line.partition("=")
+                if not (equals and clean_host(site) and number.strip().isdigit() and int(number) > 0):
+                    return "a site limit must look like example.com = 2, not %s" % line.strip()
+            value = "\n".join("%s = %d" % (site, n) for site, n in site_limits_of(value).items())
         if key in ("speedLimit", "limitSpeed"):
             value = max(value, 0)
+        if key == "proxyHost":
+            value = clean_host(value)
+        if key == "proxyPassword" and value and not value.startswith("dpapi:"):  # typed into settings.json
+            value = protect(value)
+            save = True
         settings[key] = value
     if save:
         with disk_lock:
@@ -1555,6 +2117,7 @@ def change_settings(new, save=True):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(settings, f, indent=1)
             settings_time = os.path.getmtime(path)
+    use_proxy()
     pump()  # more downloads at once may be allowed now
     return None
 
@@ -1591,11 +2154,19 @@ class Handler(BaseHTTPRequestHandler):
             kind = msg.get("type")
             try:
                 if kind == "status":
-                    reply.update(jobs=jobs, queue=queue, settings=settings, defaultFolder=OUT_DIR, dataFolder=DATA_DIR,
+                    reply.update(jobs=jobs, queue=queue, settings=public_settings(), defaultFolder=OUT_DIR, dataFolder=DATA_DIR,
                                  limitNow=current_limit())
                 elif kind == "settings":
-                    error = change_settings(msg.get("set") or {})
-                    reply = {"ok": False, "error": error} if error else {"ok": True, "settings": settings}
+                    new = dict(msg.get("set") or {})
+                    if isinstance(new.get("proxyPassword"), str):  # typed on the settings page: kept only encrypted
+                        new["proxyPassword"] = protect(new["proxyPassword"])
+                    error = change_settings(new)
+                    reply = {"ok": False, "error": error} if error else {"ok": True, "settings": public_settings()}
+                elif kind == "proxytest":
+                    reply = test_proxy(msg)
+                elif kind == "defender":  # settings page: can the scan run?
+                    d = check_defender(again=True)
+                    reply.update(available=d["available"], reason=d["reason"])
                 elif kind == "clear":
                     clear_finished()
                 elif kind == "notified":
@@ -1603,7 +2174,7 @@ class Handler(BaseHTTPRequestHandler):
                         if job_id in jobs:
                             jobs[job_id]["notified"] = True
                     save_history()
-                elif kind in ("pause", "resume", "cancel", "retry", "delete", "open", "move", "limit", "hash"):
+                elif kind in ("pause", "resume", "cancel", "retry", "delete", "open", "move", "limit", "hash", "threat"):
                     error = control(msg)
                     if error:
                         reply = {"ok": False, "error": error}
@@ -1613,7 +2184,7 @@ class Handler(BaseHTTPRequestHandler):
                     reply.update(stats(), sites=settings["statsSites"])
                 elif kind == "export":  # settings page, Export: 500 rows at a time (a reply must stay under 1 MB)
                     rows, start = stats_rows() if msg.get("part") == "stats" else history_rows(), int(msg.get("offset") or 0)
-                    reply.update(rows=rows[start:start + 500], total=len(rows), settings=settings)
+                    reply.update(rows=rows[start:start + 500], total=len(rows), settings=public_settings())
                 elif kind == "cleardata":  # settings page, Clear data: range in seconds back from now, 0 = all time
                     seconds = int(msg.get("range") or 0)
                     what = [x for x in msg.get("what") or [] if x in ("history", "stats", "thumbs", "log")]
@@ -1668,6 +2239,10 @@ def main():
     if not find_ffmpeg():
         log(NO_FFMPEG)
     load_settings()
+    use_proxy()
+    if settings["proxyMode"] != "none":
+        log("network: %s" % proxy_text(proxy_conf()))
+    threading.Thread(target=check_defender, daemon=True).start()
     if len(sys.argv) > 1:
         global keep_history
         keep_history = False

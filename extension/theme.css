@@ -139,9 +139,12 @@ button.primary:disabled { background: var(--brand); }
 .actions button:not([data-action]):hover { background: var(--surface-2); color: var(--text); }
 .actions button[data-action=cancel]:hover,
 .actions button[data-action=delete]:hover { color: var(--fail-fg); border-color: var(--fail); background: var(--fail-bg); }
+/* Windows Defender found a threat: deleting the file is the safe choice, so it stands out */
+.actions button[data-action="threat:delete"] { color: var(--on-brand); background: var(--fail); border-color: var(--fail); }
+.actions button[data-action="threat:delete"]:hover { background: var(--fail-fg); border-color: var(--fail-fg); }
 
 /* ---- inputs ---- */
-input[type=text], input[type=url], input[type=search], input[type=number], input[type=time], select, textarea {
+input[type=text], input[type=url], input[type=search], input[type=number], input[type=time], input[type=password], select, textarea {
   font: inherit;
   color: var(--text);
   background: var(--surface);

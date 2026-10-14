@@ -55,6 +55,12 @@ async function askDuplicate(dup, url, referrer, extra) {
   });
 }
 async function notificationButton(id, index) {
+  if (id.startsWith("threat:")) { // Windows Defender found a threat: 0 = delete the file, 1 = keep it
+    chrome.notifications.clear(id);
+    const reply = await ask({ type: "threat", id: id.slice(7), choice: index === 0 ? "delete" : "keep" });
+    if (!reply.ok) notify("UDM: not done", reply.error);
+    return;
+  }
   const pending = (await chrome.storage.session.get(id))[id];
   chrome.notifications.clear(id);
   if (!pending) return;
@@ -140,8 +146,15 @@ async function watch() {
       const news = jobs.filter((j) => (j.state === "done" || j.state === "failed") && !j.notified);
       if (news.length) {
         await ask({ type: "notified", ids: news.map((j) => j.id) });
+        // a threat is always announced, also with notifications off; a private one without its name
+        for (const job of news.filter((j) => j.scan === "threat")) {
+          notify("UDM: threat found", (job.private ? "In a private download" : job.name) + "\n"
+            + (job.threat || "Windows Defender found a threat") + ". Delete the file, or keep it?", {
+            id: "threat:" + job.id, options: { buttons: [{ title: "Delete file" }, { title: "Keep file" }], requireInteraction: true },
+          });
+        }
         // no notification for a private download: Windows keeps old notifications in its list
-        for (const job of reply.settings.notify ? news.filter((j) => !j.private) : []) {
+        for (const job of reply.settings.notify ? news.filter((j) => !j.private && j.scan !== "threat") : []) {
           chrome.notifications.create({
             type: "basic", iconUrl: ICON,
             title: job.state === "done" ? "UDM: download finished" : "UDM: download failed",
@@ -396,6 +409,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // stats page, thumbnails, backup, and the privacy tools (Clear data, Forget this site)
     const { type, id, offset, part, history, stats, settings, range, what, files, site, dry } = msg;
     ask({ type, id, offset, part, history, stats, settings, range, what, files, site, dry }).then(sendResponse);
+    return true;
+  } else if (msg.type === "proxytest") {
+    // settings page, Network: Test with what is typed there (an empty password means the saved one)
+    const { proxyMode, proxyType, proxyHost, proxyPort, proxyUser, proxyPassword } = msg;
+    ask({ type: "proxytest", proxyMode, proxyType, proxyHost, proxyPort, proxyUser, proxyPassword }).then(sendResponse);
+    return true;
+  } else if (msg.type === "defender") {
+    ask({ type: "defender" }).then(sendResponse); // settings page, Security: can Windows Defender scan?
     return true;
   } else if (msg.type === "status") {
     ask({ type: "status" }).then(sendResponse);

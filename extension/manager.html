@@ -67,6 +67,19 @@
   td.added { color: var(--muted); font-size: 12px; }
   td.buttons { white-space: normal; min-width: 230px; }
 
+  /* bulk actions: a tick box per row, and a bar for the ticked rows */
+  th.pick, td.pick { width: 1%; padding-right: 2px; }
+  th.pick input, td.pick input { display: block; cursor: pointer; }
+  tbody tr.checked { background: color-mix(in oklch, var(--brand) 6%, var(--surface)); }
+  tbody tr.checked:hover { background: color-mix(in oklch, var(--brand) 9%, var(--surface)); }
+  tbody tr.checked.selected { background: color-mix(in oklch, var(--brand) 13%, var(--surface)); }
+  #bulk { position: sticky; bottom: 16px; z-index: 1; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 12px; padding: 8px 10px 8px 14px; background: var(--surface); border: 1px solid var(--border-strong); border-radius: 8px; box-shadow: 0 6px 20px oklch(0.2 0.04 35 / 0.18); }
+  #bulkCount { margin-right: 8px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  #bulk button { font-variant-numeric: tabular-nums; }
+  #bulkNote { color: var(--fail-fg); font-size: 12px; }
+  #bulkNone { border-color: transparent; background: transparent; color: var(--muted); }
+  #bulkNone:hover { background: var(--surface-2); color: var(--text); }
+
   #empty { padding: 28px; text-align: center; color: var(--muted); }
   #note { color: var(--muted); font-size: 12px; margin: 12px 2px 0; }
 </style>
@@ -86,7 +99,10 @@
     <table class="keys">
       <tr><td><kbd>↑</kbd> <kbd>↓</kbd></td><td>Move between rows (or click a row)</td></tr>
       <tr><td><kbd>Space</kbd></td><td>Pause or resume the selected download</td></tr>
-      <tr><td><kbd>Delete</kbd></td><td>Delete it (asks first)</td></tr>
+      <tr><td><kbd>Delete</kbd></td><td>Delete it, or the ticked rows (asks first)</td></tr>
+      <tr><td><kbd>Shift</kbd> + click</td><td>Tick every row from the last one clicked to this one</td></tr>
+      <tr><td><kbd>Ctrl</kbd> <kbd>A</kbd></td><td>Tick every row shown</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>Untick all rows</td></tr>
       <tr><td><kbd>Enter</kbd></td><td>Open the finished file</td></tr>
       <tr><td><kbd>Ctrl</kbd> <kbd>F</kbd></td><td>Search by name</td></tr>
       <tr><td><kbd>?</kbd></td><td>This list</td></tr>
@@ -124,15 +140,26 @@
     <button id="startAll" title="Resumes every paused download and restarts every stopped stream">Start all</button>
     <button id="pauseAll" title="Pauses every running and queued download (streams are stopped)">Pause all</button>
     <button id="clear" title="Removes done and canceled jobs from the list. The files stay on disk.">Clear finished</button>
+    <button id="clearFailed" title="Removes failed jobs from the list (asks first)">Clear failed</button>
   </div>
   <div class="table">
     <table>
       <thead>
-        <tr><th>Name</th><th>Size</th><th>Progress</th><th>Speed</th><th>Time left</th><th>Status</th><th>Added</th><th>Actions</th></tr>
+        <tr><th class="pick"><input type="checkbox" id="pickAll" title="Tick every row shown" aria-label="Tick every row shown"></th><th>Name</th><th>Size</th><th>Progress</th><th>Speed</th><th>Time left</th><th>Status</th><th>Added</th><th>Actions</th></tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
     <div id="empty" hidden>No downloads here.</div>
+  </div>
+  <div id="bulk" hidden>
+    <span id="bulkCount"></span>
+    <button data-bulk="resume">Resume</button>
+    <button data-bulk="pause">Pause</button>
+    <button data-bulk="retry">Retry</button>
+    <button data-bulk="delete" class="danger">Delete</button>
+    <span id="bulkNote"></span>
+    <span class="space"></span>
+    <button id="bulkNone" title="Esc">Untick all</button>
   </div>
   <div id="note">Streams (m3u8/mpd) cannot be paused. <b>Stop</b> ends the download and <b>Restart</b> downloads it again from the beginning.</div>
   <script src="common.js"></script>

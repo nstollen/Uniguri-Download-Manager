@@ -39,6 +39,14 @@
   .segmented label:has(:checked) { color: var(--text); background: var(--surface); border-color: var(--border); box-shadow: 0 1px 2px oklch(0.3 0.05 35 / 0.12); }
   .segmented label:has(:focus-visible) { box-shadow: 0 0 0 3px var(--ring); }
   .segmented input { position: absolute; opacity: 0; pointer-events: none; }
+  input[type=password] { flex: 1; min-width: 0; }
+  #proxyManual > .hint { padding-left: 200px; }
+  .note { padding: 7px 10px; margin: 8px 0 8px 200px; font-size: 12px; border: 1px solid var(--border); border-radius: var(--radius); }
+  .note.warn { color: var(--pause-fg); background: var(--pause-bg); border-color: var(--pause); }
+  .note.bad { color: var(--fail-fg); background: var(--fail-bg); border-color: var(--fail); }
+  .note.good { color: var(--run-fg); background: var(--run-bg); border-color: var(--run); }
+  .note.wide { margin-left: 0; }
+  #proxyResult:empty, #defenderState:empty { display: none; }
 
   /* Clear data dialog */
   dialog.clear { width: min(400px, 92vw); max-width: none; }
@@ -75,9 +83,48 @@
     <h2>Downloads</h2>
     <label class="line"><span>Downloads at the same time</span><input type="number" id="maxJobs" min="1" max="32"></label>
     <label class="line"><span>Parts per download</span><input type="number" id="parts" min="1" max="32"></label>
+    <label class="line"><span>Connections per site</span><input type="number" id="siteConnections" min="1" max="32"> <span class="hint">All parts of all downloads from one site together. More parts wait for a free connection.</span></label>
+    <label class="line top"><span>Per-site limits</span><textarea id="siteLimits" rows="3" spellcheck="false" placeholder="one per line, like: some-site.com = 2 (its subdomains too)"></textarea></label>
+    <div class="hint">When a site answers "too many requests" (429 or 503), UDM halves its connections and waits before going on.</div>
     <label class="line"><span>Speed limit, KB/s</span><input type="number" id="speedLimit" min="0"> <span class="hint">0 = no limit. Applies to direct files, not to streams.</span></label>
     <label class="line"><input type="checkbox" id="limitSchedule"> Limit to <input type="number" id="limitSpeed" min="0"> KB/s from <input type="time" id="limitFrom"> to <input type="time" id="limitTo"></label>
     <div class="hint wide">Bandwidth schedule. Outside that time the speed limit above is used. The time range may pass midnight.</div>
+  </section>
+
+  <section>
+    <h2>Network</h2>
+    <div class="line">
+      <span>Proxy</span>
+      <div id="proxyMode" class="segmented" role="radiogroup" aria-label="Proxy">
+        <label><input type="radio" name="proxyMode" value="none"> No proxy</label>
+        <label><input type="radio" name="proxyMode" value="windows"> Windows proxy settings</label>
+        <label><input type="radio" name="proxyMode" value="manual"> Manual</label>
+      </div>
+    </div>
+    <div class="hint" id="proxyWindowsHint" hidden>The proxy from Windows Settings &gt; Network &amp; Internet &gt; Proxy (manual proxy setup), with its exceptions. A setup script or automatic detection is not used.</div>
+    <div id="proxyManual" hidden>
+      <label class="line"><span>Type</span>
+        <select id="proxyType"><option value="http">HTTP</option><option value="socks5">SOCKS5</option></select></label>
+      <label class="line"><span>Address</span><input type="text" id="proxyHost" spellcheck="false" placeholder="like: proxy.example.com or 192.168.1.10"></label>
+      <label class="line"><span>Port</span><input type="number" id="proxyPort" min="1" max="65535"></label>
+      <label class="line"><span>User name</span><input type="text" id="proxyUser" spellcheck="false" autocomplete="off" placeholder="optional"></label>
+      <label class="line"><span>Password</span><input type="password" id="proxyPassword" autocomplete="new-password" placeholder="optional">
+        <button id="proxyForget" title="Delete the saved password">Remove</button></label>
+      <div class="hint">Saved encrypted by Windows (DPAPI): only your Windows user on this PC can read it. Never in a backup.</div>
+      <div class="note warn" id="socksNote" hidden>Streams (m3u8, mpd) cannot use a SOCKS5 proxy, because ffmpeg only supports HTTP proxies. They connect directly, without the proxy. Direct files use it.</div>
+    </div>
+    <div class="line" id="proxyTestLine"><span></span><button id="proxyTest"title="Loads a small test page through the proxy as typed above, saved or not">Test</button>
+      <span class="hint">Direct files, playlists and subtitles use the proxy, and streams too (through ffmpeg). This PC itself (127.0.0.1) never does.</span></div>
+    <div class="note" id="proxyResult"></div>
+  </section>
+
+  <section>
+    <h2>Security</h2>
+    <label class="line"><input type="checkbox" id="scanDownloads"> Scan downloads with Windows Defender</label>
+    <div class="hint wide">Each finished download is scanned. If Defender finds a threat, a notification asks whether to delete the file or keep it.</div>
+    <div class="note wide" id="defenderState"></div>
+    <label class="line top"><span>Trusted sites</span><textarea id="trustedSites" rows="3" spellcheck="false" placeholder="one per line, like: example.com (its subdomains too)"></textarea></label>
+    <div class="hint">Downloads from these sites (the page or the file) are not scanned.</div>
   </section>
 
   <section>

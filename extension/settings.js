@@ -1,7 +1,7 @@
 // The settings page. The downloader keeps the settings (settings.json); this page shows and changes them.
-const TEXT = ["folder", "startTime", "stopTime", "limitFrom", "limitTo"];
-const NUMBER = ["maxJobs", "parts", "speedLimit", "limitSpeed"];
-const CHECK = ["ask", "sortFolders", "notify", "scheduleStart", "scheduleStop", "limitSchedule", "statsSites"];
+const TEXT = ["folder", "startTime", "stopTime", "limitFrom", "limitTo", "proxyHost", "proxyUser", "proxyType"];
+const NUMBER = ["maxJobs", "parts", "siteConnections", "speedLimit", "limitSpeed", "proxyPort"];
+const CHECK = ["ask", "sortFolders", "notify", "scheduleStart", "scheduleStop", "limitSchedule", "statsSites", "scanDownloads"];
 const SELECT = ["autoClean"]; // number choices
 // private mode is not in these lists: it changes right away (and from the popup and manager too), not with Save
 const note = document.getElementById("note");
@@ -41,6 +41,79 @@ async function load() {
   document.getElementById("dataFolder").textContent = reply.dataFolder;
   folders.replaceChildren();
   for (const [name, extensions] of Object.entries(s.folders)) folderLine(name, extensions);
+  for (const input of proxyModes) input.checked = input.value === (s.proxyMode || "none");
+  document.getElementById("trustedSites").value = words(s.trustedSites).join("\n");
+  document.getElementById("siteLimits").value = s.siteLimits || "";
+  showPassword(s.proxyPasswordSet);
+  showProxy();
+  showDefender();
+}
+
+// ---- network: the proxy ----
+const proxyModes = document.querySelectorAll("input[name=proxyMode]");
+const proxyPassword = document.getElementById("proxyPassword");
+const proxyForget = document.getElementById("proxyForget");
+const proxyResult = document.getElementById("proxyResult");
+const proxyMode = () => ([...proxyModes].find((x) => x.checked) || { value: "none" }).value;
+
+// the manual boxes only for Manual, the SOCKS5 note only for SOCKS5, Test only with a proxy.
+// An earlier Test result goes away when the proxy changes.
+function showProxy() {
+  document.getElementById("proxyManual").hidden = proxyMode() !== "manual";
+  document.getElementById("proxyWindowsHint").hidden = proxyMode() !== "windows";
+  document.getElementById("proxyTestLine").hidden = proxyMode() === "none";
+  document.getElementById("socksNote").hidden = document.getElementById("proxyType").value !== "socks5";
+  proxyResult.textContent = "";
+}
+for (const input of proxyModes) input.onchange = showProxy;
+document.getElementById("proxyManual").oninput = () => (proxyResult.textContent = "");
+document.getElementById("proxyType").onchange = showProxy;
+
+// the password box is always empty: a saved password never comes to this page, only whether there is one
+function showPassword(saved) {
+  proxyPassword.value = "";
+  proxyPassword.placeholder = saved ? "saved (type a new one to change it)" : "optional";
+  proxyForget.disabled = !saved;
+}
+proxyForget.onclick = async (e) => {
+  e.preventDefault(); // the button sits in a label
+  const reply = await chrome.runtime.sendMessage({ type: "control", action: "settings", set: { proxyPassword: "" } });
+  note.className = reply && reply.ok ? "good" : "bad";
+  note.textContent = reply && reply.ok ? "The saved proxy password is deleted." : (reply && reply.error) || "no reply from the downloader";
+  if (reply && reply.ok) showPassword(false);
+};
+
+// the proxy as typed in the form
+function readProxy() {
+  return {
+    proxyMode: proxyMode(),
+    proxyType: document.getElementById("proxyType").value,
+    proxyHost: document.getElementById("proxyHost").value.trim(),
+    proxyPort: Math.floor(Number(document.getElementById("proxyPort").value) || 0),
+    proxyUser: document.getElementById("proxyUser").value.trim(),
+  };
+}
+
+document.getElementById("proxyTest").onclick = async () => {
+  const test = document.getElementById("proxyTest");
+  test.disabled = true;
+  proxyResult.className = "note";
+  proxyResult.textContent = "Testing…";
+  const reply = await chrome.runtime.sendMessage({ type: "proxytest", ...readProxy(), proxyPassword: proxyPassword.value });
+  test.disabled = false;
+  const ok = reply && reply.ok;
+  proxyResult.className = "note " + (ok ? "good" : "bad");
+  proxyResult.textContent = ok ? "OK: the test page loaded through " + reply.via + " in " + reply.ms + " ms."
+    : "Failed: " + ((reply && reply.error) || "no reply from the downloader");
+};
+
+// ---- security: can Windows Defender scan here? ----
+async function showDefender() {
+  const state = document.getElementById("defenderState");
+  const reply = await chrome.runtime.sendMessage({ type: "defender" });
+  if (!reply || !reply.ok) return;
+  state.className = "note wide " + (reply.available ? "good" : "warn");
+  state.textContent = reply.available ? "Windows Defender is ready to scan." : "Scan not available: " + reply.reason + ". Downloads are not scanned.";
 }
 
 // ---- capture rules: kept by the extension (chrome.storage.local), see background.js ----
@@ -82,6 +155,11 @@ document.getElementById("save").onclick = async () => {
     const [name, extensions] = [...line.querySelectorAll("input")].map((i) => i.value.trim());
     if (name) set.folders[name] = extensions.toLowerCase();
   }
+  Object.assign(set, readProxy());
+  if (proxyPassword.value) set.proxyPassword = proxyPassword.value; // empty: keep the saved one
+  // "https://www.x.com/a" -> "www.x.com", like the sites to ignore
+  set.trustedSites = words(document.getElementById("trustedSites").value).map((x) => x.replace(/^[a-z]+:\/\//, "").split(/[/?#]/)[0]).join("\n");
+  set.siteLimits = document.getElementById("siteLimits").value;
   const reply = await chrome.runtime.sendMessage({ type: "control", action: "settings", set });
   const ok = reply && reply.ok;
   note.className = ok ? "good" : "bad";

@@ -7,9 +7,13 @@ const FILTERS = {
   failed: (j) => j.state === "failed",
 };
 const LABELS = { all: "All", downloading: "Downloading", paused: "Paused", done: "Done", failed: "Failed" };
-const COLUMNS = ["name", "size", "progress", "speed", "eta", "status", "added", "buttons"];
+const COLUMNS = ["pick", "name", "size", "progress", "speed", "eta", "status", "added", "buttons"];
 let filter = "all";
 let selected = null; // id of the row the keyboard works on
+const checked = new Set(); // ids of the ticked rows, for the bulk bar
+let anchor = null; // id of the row a shift+click range starts from
+let shown = []; // the jobs the filter and the search box let through, in table order
+let busy = false; // a bulk action is going through
 const views = {}; // job id -> the table row built for it, updated in place so buttons keep working
 const search = document.getElementById("search");
 
@@ -146,8 +150,15 @@ async function show() {
       cell.append(v.thumb, v.nameText);
       if (job.private) cell.append(Object.assign(document.createElement("span"), { className: "tag", textContent: "private", title: "Not saved: it leaves the list once it finishes" }));
       v.name.append(cell);
+      v.tick = Object.assign(document.createElement("input"), { type: "checkbox", title: "Tick for the bulk buttons (Shift+click: a range)" });
+      v.tick.setAttribute("aria-label", "Tick " + job.name);
+      v.tick.onclick = (e) => tick(job.id, v.tick.checked, e.shiftKey);
+      v.pick.append(v.tick);
+      v.tr.onmousedown = (e) => e.shiftKey && e.preventDefault(); // no text selection on shift+click
       v.tr.onclick = (e) => {
-        if (!e.target.closest("button")) select(job.id);
+        if (e.target.closest("button, input")) return;
+        if (e.shiftKey) tick(job.id, true, true);
+        else select(job.id);
       };
       v.statusText = document.createElement("span");
       v.hash = document.createElement("div");
@@ -159,11 +170,12 @@ async function show() {
     const est = job.estimate ? "~" : "";
     const running = job.state === "running";
     v.tr.dataset.id = job.id;
-    v.tr.dataset.state = job.state; // only for the colors in theme.css
+    const threat = job.scan === "threat" || job.scan === "deleted"; // Windows Defender found a threat
+    v.tr.dataset.state = threat ? "failed" : job.state; // only for the colors in theme.css
     v.nameText.textContent = job.name;
     v.name.title = job.name + "\n" + job.url;
     v.tr.classList.toggle("selected", job.id === selected);
-    if (job.state === "done" && !v.thumbAsked && VIDEO.test(job.name)) { // made by the downloader with ffmpeg, once
+    if (job.state === "done" && !v.thumbAsked && !threat && job.scan !== "scanning" && VIDEO.test(job.name)) { // made by the downloader with ffmpeg, once
       v.thumbAsked = true;
       chrome.runtime.sendMessage({ type: "thumb", id: job.id }).then((r) => {
         if (r && r.data) Object.assign(v.thumb, { src: r.data, hidden: false });
@@ -183,17 +195,20 @@ async function show() {
     v.eta.textContent = running && job.eta != null ? est + fmtTime(job.eta) : "";
     let status = job.state;
     if (running && job.detail.startsWith("retrying")) status = job.detail; // "retrying (2/3)"
+    if (running && job.detail === "site asked to slow down") status = job.detail;
     if (job.state === "failed") status = "failed: " + job.detail;
     if (job.state === "stopped") status = "stopped (Restart starts from the beginning)";
     if (job.state === "done") status = "done in " + fmtTime(job.elapsed) + (job.detail ? " · " + job.detail : "");
+    if (job.state === "done" && scanText(job)) status = threat ? scanText(job) : status + " · " + scanText(job);
+    if (job.scan === "scanning") status = "scanning with Windows Defender…";
     if (job.state === "queued") status = job.detail || "queued, place " + (queue.indexOf(job.id) + 1);
     if (job.limit && job.state !== "done") status += " · limit " + job.limit + " KB/s";
     if (job.hashing != null) status += " · SHA-256 " + Math.floor(job.hashing) + "%";
     v.statusText.textContent = status;
     showHash(v, job);
-    v.status.classList.toggle("failed", job.state === "failed");
+    v.status.classList.toggle("failed", job.state === "failed" || threat);
     v.added.textContent = new Date(job.added * 1000).toLocaleString();
-    const key = job.state + (job.refresh ? " refresh" : "") + (job.sha256 ? " hash" : "");
+    const key = job.state + (job.refresh ? " refresh" : "") + (job.sha256 ? " hash" : "") + " " + job.scan;
     if (v.state !== key) { // new state, new buttons
       v.state = key;
       const box = jobActions(job, show);
@@ -214,7 +229,7 @@ async function show() {
           return limit == null ? null : control("limit", job.id, { limit });
         }));
       }
-      if (job.state === "done") {
+      if (job.state === "done" && job.scan !== "scanning" && !threat) {
         extra.unshift(extraButton("Open file", job.path, () => control("open", job.id)));
         extra[0].dataset.key = "open"; // the Enter key presses it
         // checksum: calculated only on request, then compared with a pasted one
@@ -246,7 +261,116 @@ async function show() {
   const wanted = jobs.map((job) => views[job.id].tr);
   if (wanted.some((tr, i) => body.children[i] !== tr)) body.replaceChildren(...wanted);
   document.getElementById("empty").hidden = jobs.length > 0;
+  document.getElementById("clearFailed").disabled = !all.some(FILTERS.failed);
+
+  // ticked rows that left the list, the filter or the search are unticked
+  shown = jobs;
+  for (const id of checked) if (!jobs.some((job) => job.id === id)) checked.delete(id);
+  showTicks();
 }
+
+// ---- bulk actions: tick rows, then one button acts on every ticked row where it makes sense ----
+const BULK = {
+  resume: (j) => j.state === "paused" || j.state === "stopped",
+  pause: (j) => j.state === "running" || j.state === "queued",
+  retry: (j) => j.state === "failed" || j.state === "canceled",
+  delete: (j) => j.state !== "running" && j.state !== "queued",
+};
+const BULK_VERB = { resume: "resumed", pause: "paused", retry: "retried", delete: "deleted" };
+const pickAll = document.getElementById("pickAll");
+
+// tick or untick one row; with shift, every row from the anchor to it
+function tick(id, on, range) {
+  const ids = shown.map((job) => job.id);
+  const from = ids.indexOf(anchor);
+  const to = ids.indexOf(id);
+  for (const x of range && from >= 0 ? ids.slice(Math.min(from, to), Math.max(from, to) + 1) : [id]) {
+    if (on) checked.add(x);
+    else checked.delete(x);
+  }
+  anchor = id;
+  showTicks();
+}
+
+// the tick boxes, the header box and the bulk bar
+function showTicks() {
+  for (const job of shown) {
+    const v = views[job.id];
+    v.tick.checked = checked.has(job.id);
+    v.tr.classList.toggle("checked", checked.has(job.id));
+  }
+  pickAll.checked = shown.length > 0 && checked.size === shown.length;
+  pickAll.indeterminate = checked.size > 0 && checked.size < shown.length;
+  pickAll.disabled = !shown.length;
+  const picked = shown.filter((job) => checked.has(job.id));
+  document.getElementById("bulk").hidden = !picked.length;
+  document.getElementById("bulkCount").textContent = picked.length + " selected";
+  for (const button of document.querySelectorAll("#bulk [data-bulk]")) {
+    const action = button.dataset.bulk;
+    const n = picked.filter(BULK[action]).length;
+    button.textContent = button.textContent.replace(/ \(\d+\)$/, "") + (n ? " (" + n + ")" : "");
+    button.disabled = busy || !n;
+    button.title = n === picked.length ? "All " + n + " can be " + BULK_VERB[action]
+      : n + " of the " + picked.length + " selected can be " + BULK_VERB[action] + "; the others are skipped";
+  }
+}
+
+pickAll.onclick = () => {
+  const on = pickAll.checked; // all ticked before the click: untick all, otherwise tick all
+  for (const job of shown) {
+    if (on) checked.add(job.id);
+    else checked.delete(job.id);
+  }
+  anchor = null;
+  showTicks();
+};
+document.getElementById("bulkNone").onclick = () => {
+  checked.clear();
+  showTicks();
+};
+
+// One control message per job (like Start all), so resume and retry get fresh cookies.
+async function runBulk(action) {
+  const targets = shown.filter((job) => checked.has(job.id) && BULK[action](job));
+  if (busy || !targets.length) return;
+  const extra = {};
+  if (action === "delete") { // the same question as one row's Delete
+    const names = targets.slice(0, 3).map((job) => job.name).join(", ") + (targets.length > 3 ? " and " + (targets.length - 3) + " more" : "");
+    const choice = targets.length === 1 ? await askDelete(targets[0])
+      : await choose("Delete " + targets.length + " downloads?", names,
+        [["Remove from list only", "list"], ["Also delete the files from disk", "file"], ["Keep", ""]]);
+    if (!choice) return;
+    extra.deleteFile = choice === "file";
+  }
+  busy = true;
+  showTicks();
+  const note = document.getElementById("bulkNote");
+  note.textContent = note.title = "";
+  const errors = [];
+  for (const job of targets) {
+    const reply = await control(action, job.id, extra);
+    if (!reply || !reply.ok) errors.push(job.name + ": " + ((reply && reply.error) || "no reply from the downloader"));
+  }
+  if (errors.length) {
+    note.textContent = errors.length + " not " + BULK_VERB[action] + ": " + errors[0];
+    note.title = errors.join("\n");
+  }
+  busy = false;
+  show();
+}
+for (const button of document.querySelectorAll("#bulk [data-bulk]")) button.onclick = () => runBulk(button.dataset.bulk);
+
+// Clear failed: every failed job leaves the list, after a question
+document.getElementById("clearFailed").onclick = async () => {
+  const reply = await chrome.runtime.sendMessage({ type: "status" });
+  const failed = Object.values((reply && reply.jobs) || {}).filter(FILTERS.failed);
+  if (!failed.length) return;
+  const choice = await choose("Remove " + failed.length + " failed " + (failed.length === 1 ? "download" : "downloads") + " from the list?",
+    "Their unfinished part files are deleted too, so they cannot be retried.", [["Remove", "delete"], ["Cancel", ""]]);
+  if (!choice) return;
+  for (const job of failed) await control("delete", job.id, { deleteFile: false });
+  show();
+};
 
 for (const button of document.querySelectorAll("#filters button")) {
   button.onclick = () => {
@@ -270,7 +394,7 @@ document.getElementById("keysButton").onclick = () => keys.showModal();
 document.getElementById("keysClose").onclick = () => keys.close();
 
 function select(id) {
-  selected = id;
+  selected = anchor = id;
   for (const tr of document.querySelectorAll("#rows tr")) tr.classList.toggle("selected", tr.dataset.id === id);
 }
 
@@ -282,8 +406,16 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   // typing in a box, a button with focus (Enter and Space press it), or an open dialog: not ours
-  if (e.ctrlKey || e.altKey || e.metaKey || document.querySelector("dialog[open]")) return;
-  if (e.target.closest("input, select, textarea, button, a, summary")) return;
+  if (document.querySelector("dialog[open]")) return;
+  const box = e.target.closest("#pickAll, td.pick input"); // a tick box with focus: Space ticks it, the other keys are ours
+  if (e.ctrlKey && !e.altKey && e.key.toLowerCase() === "a" && (box || !e.target.closest("input, select, textarea"))) {
+    e.preventDefault(); // tick every row shown, not select the page's text
+    for (const job of shown) checked.add(job.id);
+    showTicks();
+    return;
+  }
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
+  if (e.target.closest("input, select, textarea, button, a, summary") && !(box && e.key !== " ")) return;
   const rows = [...document.querySelectorAll("#rows tr")];
   const at = rows.findIndex((tr) => tr.dataset.id === selected);
   const row = rows[at];
@@ -303,7 +435,11 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     press("[data-action=pause]") || press("[data-action=resume]");
   } else if (e.key === "Delete") {
-    press("[data-action=delete]");
+    if (shown.some((job) => checked.has(job.id))) runBulk("delete");
+    else press("[data-action=delete]");
+  } else if (e.key === "Escape" && checked.size) {
+    checked.clear();
+    showTicks();
   } else if (e.key === "Enter") {
     press("[data-key=open]");
   } else if (e.key === "?") {

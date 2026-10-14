@@ -92,18 +92,20 @@ const views = {}; // job id -> the row built for it, updated in place so buttons
 // the text under the bar. "~" marks a stream's estimated total size and time left
 function describe(job) {
   if (job.state === "failed") return "failed · " + job.detail;
+  if (job.scan === "scanning") return "scanning with Windows Defender…";
   const est = job.estimate ? "~" : "";
   const parts = [job.state];
   if (job.state === "done") {
     parts.push(fmtSize(job.total), "took " + fmtTime(job.elapsed));
     if (job.detail) parts.push(job.detail); // "2 subtitles saved"
+    if (scanText(job)) parts.push(scanText(job)); // "scanned, clean"
   } else if (job.state === "stopped") {
     parts.push("streams cannot pause: Restart starts from the beginning");
   } else if (job.state === "canceled") {
     // nothing more to say
   } else if (job.percent != null) {
     parts.push(fmtSize(job.done) + " / " + est + fmtSize(job.total));
-    if (job.state === "running") parts.push(fmtSpeed(job.speed));
+    if (job.state === "running") parts.push(job.detail === "site asked to slow down" ? job.detail : fmtSpeed(job.speed));
     if (job.state === "running" && job.eta != null) parts.push(est + fmtTime(job.eta) + " left");
   } else if (job.state === "queued") {
     parts.push(job.detail || "waiting for a free place");
@@ -144,11 +146,12 @@ async function showJobs() {
       v.progress.value = job.percent;
       v.percent.textContent = (job.state === "done" ? 100 : Math.min(job.percent, 99.9).toFixed(1)) + "%";
     }
-    v.row.dataset.state = job.state; // only for the colors in theme.css
+    const threat = job.scan === "threat" || job.scan === "deleted";
+    v.row.dataset.state = threat ? "failed" : job.state; // only for the colors in theme.css
     v.meta.textContent = describe(job);
-    v.meta.classList.toggle("failed", job.state === "failed");
-    if (v.state !== job.state) { // new state, new buttons
-      v.state = job.state;
+    v.meta.classList.toggle("failed", job.state === "failed" || threat);
+    if (v.state !== job.state + job.scan) { // new state, new buttons
+      v.state = job.state + job.scan;
       if (v.actions) v.actions.remove();
       v.actions = jobActions(job, showJobs);
       v.meta.after(v.actions);

@@ -28,10 +28,24 @@ function control(action, id, extra) {
   return chrome.runtime.sendMessage({ type: "control", action, id, ...extra });
 }
 
+// What Windows Defender's scan said about a finished download, for the status line ("" when there was no scan).
+const SCAN_TEXT = {
+  clean: "scanned, clean", trusted: "not scanned (trusted site)", unavailable: "scan not available", failed: "scan failed",
+  kept: "threat found, file kept", deleted: "threat found, file deleted",
+};
+function scanText(job) {
+  return job.scan === "threat" ? "threat found: " + (job.threat || "unknown") : SCAN_TEXT[job.scan] || "";
+}
+
 // The buttons a job can have right now, as [label, action, tooltip].
 function jobButtons(job) {
   const stream = job.kind === "stream";
   const list = [];
+  if (job.scan === "scanning") return list; // the download is finished: nothing to pause or cancel
+  if (job.scan === "threat") {
+    list.push(["Delete file", "threat:delete", "Windows Defender found " + (job.threat || "a threat") + " in this file. Deletes it from disk."]);
+    list.push(["Keep file", "threat:keep", "Keep the file anyway. Only if you trust it."]);
+  }
   if (job.state === "running") {
     list.push(stream ? ["Stop", "pause", STREAM_NOTE] : ["Pause", "pause", "Keeps what is downloaded so far"]);
   }
@@ -120,7 +134,8 @@ function jobActions(job, refresh) {
         extra.deleteFile = choice === "file";
       }
       button.disabled = true;
-      const reply = await control(action, job.id, extra);
+      const [name, pick] = action.split(":"); // "threat:delete" -> the threat action with a choice
+      const reply = await control(name, job.id, pick ? { ...extra, choice: pick } : extra);
       if (!reply || !reply.ok) button.title = (reply && reply.error) || "no reply from the downloader";
       if (action === "refresh") button.disabled = false; // the job stays failed until the new link is caught
       refresh();
