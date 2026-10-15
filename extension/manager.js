@@ -274,7 +274,7 @@ const BULK = {
   resume: (j) => j.state === "paused" || j.state === "stopped",
   pause: (j) => j.state === "running" || j.state === "queued",
   retry: (j) => j.state === "failed" || j.state === "canceled",
-  delete: (j) => j.state !== "running" && j.state !== "queued",
+  delete: (j) => j.state !== "running" && j.state !== "queued" && j.scan !== "scanning", // like the row's own Delete
 };
 const BULK_VERB = { resume: "resumed", pause: "paused", retry: "retried", delete: "deleted" };
 const pickAll = document.getElementById("pickAll");
