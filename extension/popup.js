@@ -15,7 +15,7 @@ function row(nameText, metaText, title) {
   meta.textContent = metaText;
   info.append(name, meta);
   row.append(info);
-  return { row, meta };
+  return { row, meta, name };
 }
 
 // "1280x720 · 2.3 Mbps · ~41.0 MB"
@@ -139,7 +139,9 @@ async function showJobs() {
       v.bar.append(v.progress, v.percent);
       v.meta.before(v.bar);
     }
-    // then only change what moved. No bar when the percent is unknown, or the job failed.
+    // then only change what moved: the name too, once the server says the real one. No bar when the
+    // percent is unknown, or the job failed.
+    if (v.name.firstChild.data !== job.name) v.name.firstChild.data = v.name.title = job.name;
     const showBar = job.percent != null && job.state !== "failed" && job.state !== "canceled";
     v.bar.hidden = !showBar;
     if (showBar) {

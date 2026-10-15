@@ -247,7 +247,8 @@ async function capture(item) {
   const url = item.finalUrl || item.url;
   if (!/^https?:/i.test(url) || item.state !== "in_progress") return false; // blob:, data: only exist in the browser
   if (handedBack.delete(url)) return false; // our own fallback after a failed hand-off
-  const name = (item.filename || "").split(/[\\/]/).pop() || fileName(url);
+  const chosen = (item.filename || "").split(/[\\/]/).pop(); // the name the browser would save it as
+  const name = chosen || fileName(url);
   const size = item.totalBytes > 0 ? item.totalBytes : 0;
   const drop = () => chrome.downloads.cancel(item.id, () => chrome.downloads.erase({ id: item.id }));
 
@@ -260,7 +261,7 @@ async function capture(item) {
   // ---- output: the downloader gets it (a duplicate asks with a notification) ----
   // an incognito download is private: the downloader keeps nothing of it
   drop();
-  const reply = await handOff(url, item.referrer, { size, private: !!item.incognito });
+  const reply = await handOff(url, item.referrer, { size, filename: chosen, private: !!item.incognito });
   if (!reply.ok && !reply.duplicate && item.incognito) {
     // the browser's own copy would land in the normal window's download list, so say it instead
     notify("UDM: could not start the download", fileName(url) + "\n" + reply.error);

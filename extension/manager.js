@@ -174,6 +174,7 @@ async function show() {
     v.tr.dataset.state = threat ? "failed" : job.state; // only for the colors in theme.css
     v.nameText.textContent = job.name;
     v.name.title = job.name + "\n" + job.url;
+    v.tick.setAttribute("aria-label", "Tick " + job.name);
     v.tr.classList.toggle("selected", job.id === selected);
     if (job.state === "done" && !v.thumbAsked && !threat && job.scan !== "scanning" && VIDEO.test(job.name)) { // made by the downloader with ffmpeg, once
       v.thumbAsked = true;

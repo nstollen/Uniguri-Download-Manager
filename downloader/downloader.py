@@ -13,6 +13,7 @@ import glob
 import hashlib
 import itertools
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -185,7 +186,8 @@ LINK = re.compile(r"\b(?:https?|ftp)://[^\s'\"<>|]+", re.I)
 STAMP = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) ")  # the time at the start of a log line
 # what history.json keeps of each job. Cookies are never written to disk.
 SAVED = ("id", "name", "kind", "url", "referrer", "userAgent", "title", "path", "done", "elapsed", "limit",
-         "notified", "variant", "subtitles", "subFormat", "audioOnly", "refresh", "sha256", "scan", "threat")
+         "notified", "variant", "subtitles", "subFormat", "audioOnly", "refresh", "sha256", "scan", "threat",
+         "named")
 
 
 def log(text, job=None):
@@ -266,6 +268,7 @@ def load_history():
         if job["scan"] == "scanning":  # the downloader was closed during the scan
             job["scan"] = "failed"
         job["notified"] = job["notified"] is not False  # old news is not announced again
+        job["named"] = job["named"] is not False  # a job saved by an older UDM keeps its name
         jobs[job["id"]] = job
         live[job["id"]] = {"stop": "", "proc": None, "cookies": ""}
     next_id = itertools.count(max([int(x) for x in jobs] + [0]) + 1)
@@ -280,6 +283,98 @@ def find_ffmpeg():
 def safe_name(text):
     """Turn a url file name or page title into a valid Windows file name."""
     return re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", text or "").strip(". ")[:120]
+
+
+def file_name_of(text):
+    """safe_name for a file name that has to keep its extension: the last part of a path, cut to 120 characters
+    without losing the extension."""
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", re.split(r"[\\/]", text or "")[-1]).strip(". ")
+    if len(name) > 120:
+        stem, ext = os.path.splitext(name)
+        ext = ext if len(ext) <= 16 else ""
+        name = stem[:120 - len(ext)].rstrip(". ") + ext
+    return name
+
+
+def url_file_name(url):
+    """The file name at the end of a url's path: "https://x/a/My%20File.zip?t=1" -> "My File.zip"."""
+    return file_name_of(urllib.parse.unquote(urllib.parse.urlsplit(url or "").path))
+
+
+def disposition_name(value):
+    """The file name in a Content-Disposition header: filename*=UTF-8''... (RFC 5987) first, then filename=."""
+    found = re.search(r"filename\*\s*=\s*\"?([\w!#$&+.^`|~-]+)'[^']*'([^;\s\"]+)", value or "", re.I)
+    if found:
+        try:
+            return urllib.parse.unquote(found.group(2), encoding=found.group(1), errors="strict")
+        except (LookupError, UnicodeDecodeError):
+            pass
+    found = re.search(r'(?:^|;)\s*filename\s*=\s*(?:"((?:\\.|[^"\\])*)"|([^;]*))', value or "", re.I)
+    if not found:
+        return ""
+    text = re.sub(r"\\(.)", r"\1", found.group(1)) if found.group(1) is not None else found.group(2).strip()
+    try:
+        text = text.encode("latin-1").decode("utf-8")  # raw UTF-8 bytes, which http.client reads as latin-1
+    except UnicodeError:
+        pass
+    return urllib.parse.unquote(text)
+
+
+MIME_TYPES = mimetypes.MimeTypes()  # Python's own table only, not the registry's (it differs between PCs)
+TYPE_EXT = {"application/x-msdownload": ".exe", "application/x-msdos-program": ".exe",
+            "application/vnd.microsoft.portable-executable": ".exe", "application/x-msi": ".msi",
+            "application/x-ms-installer": ".msi", "application/x-zip-compressed": ".zip",
+            "application/x-7z-compressed": ".7z", "application/vnd.rar": ".rar", "application/x-rar-compressed": ".rar",
+            "image/jpeg": ".jpg", "audio/mpeg": ".mp3", "text/plain": ".txt"}
+BINARY_TYPES = ("application/octet-stream", "binary/octet-stream", "application/force-download",
+                "application/download", "application/x-download")
+
+
+def type_ext(content_type, urls):
+    """The extension for a Content-Type, for a name that has none ("" when it says nothing). A general
+    binary type says nothing by itself; a ".exe" in one of the urls makes it an exe."""
+    kind = (content_type or "").split(";")[0].strip().lower()
+    if kind in BINARY_TYPES:
+        return ".exe" if any(re.search(r"\.exe\b", urllib.parse.unquote(u or "").lower()) for u in urls) else ""
+    return TYPE_EXT.get(kind) or (MIME_TYPES.guess_extension(kind) or "" if kind else "")
+
+
+def folder_for(name):
+    """The download folder for a new file: the main one, or its file type's subfolder with Sort into folders."""
+    folder = settings["folder"] or OUT_DIR
+    if settings["sortFolders"]:
+        ext = os.path.splitext(name)[1][1:].lower()
+        folder = os.path.join(folder, next((sub for sub, exts in settings["folders"].items()
+                                            if ext in exts.lower().replace(",", " ").split()), "other"))
+    return folder
+
+
+def settle_name(job, r):
+    """Once the server's first answer r is in: the real file name of a job whose name came from its url only
+    (the browser gave none). In this order: Content-Disposition, the last part of the url after redirects, of
+    the url itself, then "download"; a name without an extension gets one from Content-Type. The job moves to
+    that name (and its type's folder, when it was in the folder of the old name) before any byte is written."""
+    if job.get("named"):
+        return
+    job["named"] = True
+    final = r.geturl() if hasattr(r, "geturl") else job["url"]
+    name = (file_name_of(disposition_name(r.headers.get("Content-Disposition")))
+            or url_file_name(final) or url_file_name(job["url"]) or "download")
+    if not os.path.splitext(name)[1]:
+        name += type_ext(r.headers.get("Content-Type"), [final, job["url"]])
+    if job.get("audioOnly"):
+        name = os.path.splitext(name)[0] + ".mp3"
+    with lock:
+        folder = os.path.dirname(job["path"])
+        if os.path.normcase(folder) == os.path.normcase(folder_for(job["name"])):
+            folder = folder_for(name)
+        if os.path.normcase(os.path.join(folder, name)) != os.path.normcase(job["path"]):
+            os.makedirs(folder, exist_ok=True)
+            job["path"] = ""  # its old place is not taken by itself
+            target = free_path(os.path.join(folder, name), job["url"])
+            log("  file name from the server: %s (was %s)" % (os.path.basename(target), job["name"]), job)
+            job.update(path=target, name=os.path.basename(target))
+    save_history()
 
 
 def free_path(path, url):
@@ -324,7 +419,7 @@ def ask_path(job_id):
         if job_id not in jobs:
             return
         if chosen:
-            job.update(path=os.path.normpath(chosen), name=os.path.basename(chosen), detail="")
+            job.update(path=os.path.normpath(chosen), name=os.path.basename(chosen), detail="", named=True)
             start(job_id, live[job_id]["queued"])
         else:
             job.update(state="canceled", detail="", finished=time.time())
@@ -628,6 +723,14 @@ def download(job, ctl):
     samples = []
     parts = max(1, int(settings["parts"]))
 
+    def settle(r):
+        """The server's first answer is in: the job may get its real name now (nothing is on disk yet)."""
+        nonlocal name, target, state_path
+        if not job.get("named") and state is None and not job["done"]:
+            settle_name(job, r)
+            name, target = job["name"], source(job)
+            state_path = target + ".progress.json"
+
     def report(done, total):
         """Store bytes done, speed and time left in the job for the popup."""
         now = time.time()
@@ -679,6 +782,7 @@ def download(job, ctl):
             # network trouble, not a "no ranges" answer: stop here so saved parts stay resumable
             return "cannot reach server: %s. Resume to try again." % e
         first = (r, site)
+        settle(r)
         if r.status == 206:
             try:
                 where, _, total = r.headers["Content-Range"].partition(" ")[2].partition("/")
@@ -724,6 +828,7 @@ def download(job, ctl):
             try:
                 if r is None:
                     r = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30)
+                    settle(r)
                 with r, open(target + ".part", "wb") as f:
                     total = int(r.headers.get("Content-Length") or 0)
                     if no_room(total):
@@ -1630,7 +1735,9 @@ def add(msg):
     if is_stream:  # name the mp4 (or mp3) after the page title
         name = (safe_name(msg.get("title")) or os.path.splitext(base)[0] or "video") + (".mp3" if audio else ".mp4")
     else:
-        name = base or "download.bin"
+        # the name the browser would use (it read Content-Disposition), else the url's for now: the server's
+        # answer decides it (settle_name)
+        name = file_name_of(msg.get("filename")) or base or "download"
         if audio:
             name = os.path.splitext(name)[0] + ".mp3"
     # private: from an incognito window, or private mode is on. Never saved, and gone once it finishes
@@ -1648,12 +1755,7 @@ def add(msg):
             return {"id": same["id"], "name": same["name"], "path": same["path"], "size": same["total"]}
     with lock:
         # ---- where to save: the folder for this file type, and a name that is not taken ----
-        folder = settings["folder"] or OUT_DIR
-        if settings["sortFolders"]:
-            ext = os.path.splitext(name)[1][1:].lower()
-            folder = os.path.join(folder, next((sub for sub, exts in settings["folders"].items()
-                                                if ext in exts.lower().replace(",", " ").split()), "other"))
-        target = free_path(os.path.join(folder, name), url)
+        target = free_path(os.path.join(folder_for(name), name), url)
         name = os.path.basename(target)
         job_id = str(next(next_id))
         jobs[job_id] = {"id": job_id, "name": name, "kind": "stream" if is_stream else "file", "url": url,
@@ -1663,7 +1765,8 @@ def add(msg):
                         "speed": 0, "eta": None, "elapsed": 0, "estimate": is_stream, "position": 0, "notified": False,
                         "added": time.time(), "finished": None, "variant": variant, "subtitles": subtitles,
                         "subFormat": "srt" if msg.get("subFormat") == "srt" else "vtt", "audioOnly": audio,
-                        "refresh": False, "sha256": "", "hashing": None, "private": private, "scan": "", "threat": ""}
+                        "refresh": False, "sha256": "", "hashing": None, "private": private, "scan": "", "threat": "",
+                        "named": is_stream or bool(file_name_of(msg.get("filename")))}
         live[job_id] = {"stop": "", "proc": None, "cookies": msg.get("cookies", ""), "queued": bool(msg.get("queue"))}
         job = jobs[job_id]
         log("job %s: %s from %s%s" % (job_id, name, urllib.parse.urlsplit(url).hostname or "?",
