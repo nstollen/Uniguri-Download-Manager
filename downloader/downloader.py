@@ -2029,9 +2029,9 @@ def open_manager():
         log("tray: could not open the download manager: %s" % e)
 
 
-def quit_downloader():
-    """Tray: Quit."""
-    log("quit from the tray icon")
+def quit_downloader(reason="from the tray icon"):
+    """Tray: Quit. Also when the tray's hidden window is closed (Setup, taskkill without /F)."""
+    log("quit %s" % reason)
     drop_private()
     save_history()
     tray.remove()
@@ -2232,10 +2232,86 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+# ---- one downloader at a time: a second start (autostart, Start menu, Setup) must not add a second tray icon ----
+ERROR_ALREADY_EXISTS = 183
+MB_ICONERROR, MB_SETFOREGROUND, MB_TOPMOST = 0x10, 0x10000, 0x40000
+instance_mutex = None  # held (never closed) while this downloader runs; Windows frees it when the process ends
+
+
+def first_instance():
+    """True when no other downloader for PORT is running: takes a named Windows mutex for this login session."""
+    global instance_mutex
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    instance_mutex = kernel32.CreateMutexW(None, False, "Local\\UDM downloader %d" % PORT)
+    return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
+
+
+class Server(ThreadingHTTPServer):
+    """The http server, alone on its port. HTTPServer asks for SO_REUSEADDR, and on Windows that lets a second
+    program (or a second UDM) bind the same port without an error: exclusive use makes that bind fail instead."""
+    allow_reuse_address = False
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def answers_like_udm():
+    """True when what listens on PORT is a UDM downloader (an older one, from before the mutex)."""
+    try:
+        req = urllib.request.Request("http://127.0.0.1:%d" % PORT, b'{"type": "status"}',
+                                     {"Content-Type": "application/json"})
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=3) as r:
+            return "jobs" in json.load(r)
+    except Exception:
+        return False
+
+
+def port_owner():
+    """The program listening on PORT, like "nginx.exe (process 1234)", or "" when Windows does not say."""
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True, timeout=10,
+                             creationflags=subprocess.CREATE_NO_WINDOW).stdout
+        # the listening line: local address on PORT, no remote address (the state's name is translated)
+        pid = next(cols[-1] for cols in map(str.split, out.splitlines())
+                   if len(cols) == 5 and cols[1].endswith(":%d" % PORT) and cols[2].endswith(":0"))
+        row = subprocess.run(["tasklist", "/FI", "PID eq %s" % pid, "/FO", "CSV", "/NH"], capture_output=True,
+                             text=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW).stdout
+        name = row.split('","')[0].strip().strip('"')
+        return "%s (process %s)" % (name, pid) if name.lower().endswith(".exe") else "process %s" % pid
+    except Exception:
+        return ""
+
+
+def port_taken(error):
+    """PORT is used by a program that is not UDM: say so in the log and in a window, since there is no console."""
+    owner = port_owner()
+    text = ("UDM cannot start: port %d on this PC is already used by another program%s.\n\n"
+            "The browser extension talks to UDM on that port, so UDM cannot work while it is taken. "
+            "Close that program, then start UDM again." % (PORT, " (%s)" % owner if owner else ""))
+    log("%s (%s)" % (text.replace("\n\n", " "), error))
+    ctypes.windll.user32.MessageBoxW(None, text, "UDM", MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST)
+
+
 def main():
     if sys.stdout is None:  # started by pythonw (no console): write the log to a file instead
         os.makedirs(OUT_DIR, exist_ok=True)
         sys.stdout = sys.stderr = open(LOG, "a", buffering=1, encoding="utf-8")
+    server = None
+    if len(sys.argv) == 1:  # the background downloader (not a one-file test run): one at a time, port first,
+        if not first_instance():  # then the tray icon, so a copy that cannot run never shows one
+            log("another UDM downloader is already running on port %d, so this one quits" % PORT)
+            sys.exit(0)
+        try:
+            server = Server(("127.0.0.1", PORT), Handler)
+        except OSError as e:
+            if answers_like_udm():
+                log("an older UDM downloader is already running on port %d, so this one quits" % PORT)
+                sys.exit(0)
+            port_taken(e)
+            sys.exit(1)
     if not find_ffmpeg():
         log(NO_FFMPEG)
     load_settings()
@@ -2255,12 +2331,13 @@ def main():
         if not os.path.exists(os.path.join(DATA_DIR, "stats.json")):  # first start with stats: begin with the history
             log_stats([stats_row(j) for j in jobs.values() if j["state"] == "done"])
         threading.Thread(target=tick, daemon=True).start()
-        threading.Thread(target=tray.run, args=("UDM tray %d" % PORT, tray_tip, TRAY_MENU, TRAY_COMMANDS),
+        closed = lambda: quit_downloader("by another program (Setup or taskkill)")  # noqa: E731
+        threading.Thread(target=tray.run, args=("UDM tray %d" % PORT, tray_tip, TRAY_MENU, TRAY_COMMANDS, closed),
                          daemon=True).start()
         atexit.register(tray.remove)  # Ctrl+C: no icon left behind
         atexit.register(drop_private)
         log("downloader listening on port %d, saving to %s" % (PORT, settings["folder"] or OUT_DIR))
-        ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+        server.serve_forever()
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 Hover: tip() (active downloads, total speed). Right-click: a menu; picking an item calls commands[id].
 Double-click: the first command (open the download manager).
+Closing its hidden window (taskkill without /F, which Setup uses) runs on_close, the same as the menu's Quit.
 """
 import ctypes
 import os
@@ -11,7 +12,7 @@ from ctypes import wintypes
 user32, shell32, kernel32 = ctypes.windll.user32, ctypes.windll.shell32, ctypes.windll.kernel32
 LRESULT = ctypes.c_ssize_t
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
-WM_DESTROY, WM_COMMAND, WM_TIMER, WM_NULL = 0x0002, 0x0111, 0x0113, 0x0000
+WM_DESTROY, WM_CLOSE, WM_COMMAND, WM_TIMER, WM_NULL = 0x0002, 0x0010, 0x0111, 0x0113, 0x0000
 WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TRAY = 0x0203, 0x0205, 0x0400 + 20
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 1, 2, 4
@@ -59,15 +60,16 @@ icon_data = NOTIFYICONDATAW()  # the one icon; remove() needs it from any thread
 
 
 def remove():
-    """Take the icon away (quit, or the downloader stops)."""
+    """Take the icon away (quit, or the downloader stops). Once is enough: later calls do nothing."""
     if icon_data.hWnd:
         shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(icon_data))
+        icon_data.hWnd = None
 
 
-def run(title, tip, menu, commands):
+def run(title, tip, menu, commands, on_close=None):
     """Show the icon and handle its messages until the process ends. Call it in its own thread.
-    title: name of the hidden window (tests find it by this). tip(): the hover text, asked every 2 seconds.
-    menu: [(id, label)], id 0 = a line. commands: id -> function."""
+    title: name of the hidden window (tests and Setup find it by this). tip(): the hover text, asked every 2 seconds.
+    menu: [(id, label)], id 0 = a line. commands: id -> function. on_close(): the window is asked to close."""
     # ---- input: a hidden window that receives the icon's mouse messages ----
     instance = kernel32.GetModuleHandleW(None)
     taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")  # Explorer restarted: add the icon again
@@ -100,8 +102,10 @@ def run(title, tip, menu, commands):
         elif message == WM_TIMER:  # keep the hover text fresh
             icon_data.szTip = tip()[:127]
             shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(icon_data))
-        elif message == taskbar_created:
+        elif message == taskbar_created and icon_data.hWnd:  # not after remove(): a quitting downloader
             add()
+        elif message == WM_CLOSE and on_close:
+            on_close()
         elif message == WM_DESTROY:
             remove()
         else:

@@ -87,21 +87,46 @@ Type: filesandordirs; Name: "{app}"
 var
   Update: Boolean;  { an older UDM was installed: the extension only needs a reload }
 
+function DownloaderRunning: Boolean;  { any udm-downloader.exe, from this install or not }
+var
+  Code: Integer;
+begin
+  Result := Exec(ExpandConstant('{cmd}'), '/C tasklist /FI "IMAGENAME eq udm-downloader.exe" /NH | find /I "udm-downloader.exe"',
+    '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0);
+end;
+
+procedure WaitForDownloaders(Tenths: Integer);
+var
+  I: Integer;
+begin
+  for I := 1 to Tenths do begin
+    if not DownloaderRunning then Exit;
+    Sleep(100);
+  end;
+end;
+
 procedure StopDownloader;
 var
   I, Code: Integer;
+  Wnd: HWND;
 begin
-  { the tray icon's Quit (posted to its hidden window): saves the history and closes cleanly }
-  if FindWindowByWindowName('{#Tray}') <> 0 then begin
-    PostMessage(FindWindowByWindowName('{#Tray}'), $0111 { WM_COMMAND }, 4, 0);
-    for I := 1 to 100 do begin
-      if FindWindowByWindowName('{#Tray}') = 0 then Break;
-      Sleep(100);
-    end;
+  { 1. the tray icon's Quit, posted to the hidden window of every copy that runs (an older UDM could run more
+    than one): each saves its history, takes its icon away and ends. 10 seconds for all of them together }
+  for I := 1 to 100 do begin
+    Wnd := FindWindowByWindowName('{#Tray}');
+    if Wnd = 0 then Break;
+    PostMessage(Wnd, $0111 { WM_COMMAND }, 4, 0);
+    Sleep(100);
   end;
-  { not closed after 10 seconds, or no tray icon: stop it; also a host the browser has running right now }
+  { 2. copies without that window (still starting, another port): taskkill without /F closes their windows,
+    which is the same clean Quit (and an older UDM at least takes its icon away) }
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM udm-downloader.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  WaitForDownloaders(50);
+  { 3. still running (stuck): stop it; also a host the browser has running right now. Then wait until every
+    copy is really gone, so its files can be replaced }
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM udm-downloader.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM udm-host.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  WaitForDownloaders(100);
   Sleep(500);  { Windows lets go of the files }
 end;
 
