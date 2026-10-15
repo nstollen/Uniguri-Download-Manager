@@ -61,10 +61,15 @@ ACTIVE = ("running", "queued")  # states of a job that is downloading or waiting
 # what the user can change on the settings page; kept in settings.json.
 # Speed limits are in KB per second, 0 = no limit.
 settings_time = 0  # when settings.json was last written, to notice edits made by hand
+SETTINGS_VERSION = 2  # 2: siteConnections default 8 -> 0 (no limit), see upgrade_settings()
 settings = {
+    "settingsVersion": SETTINGS_VERSION,
+    # maxJobs: downloads at once from the queue (queued, scheduled, Start all, Download all links); a download
+    # started from the browser or with Add URL starts right away, like IDM, and does not count
     "maxJobs": 3, "parts": 8, "speedLimit": 0,
-    # connections to one site, all its downloads together, and per-site exceptions ("example.com = 2", one per line)
-    "siteConnections": 8, "siteLimits": "",
+    # connections to one site, all its downloads together (0 = no limit), and per-site exceptions
+    # ("example.com = 2", one per line)
+    "siteConnections": 0, "siteLimits": "",
     "folder": "",  # where files are saved, "" = OUT_DIR
     "sortFolders": True,  # put each file in the subfolder that lists its extension, or in "other"
     "folders": {
@@ -320,7 +325,7 @@ def ask_path(job_id):
             return
         if chosen:
             job.update(path=os.path.normpath(chosen), name=os.path.basename(chosen), detail="")
-            start(job_id)
+            start(job_id, live[job_id]["queued"])
         else:
             job.update(state="canceled", detail="", finished=time.time())
     save_history()
@@ -397,11 +402,13 @@ def throttle(job, ctl, n):
 
 
 # ---- per-site connection limits: every connection of every direct download to one site takes one of the site's
-# slots (siteConnections, or its line in siteLimits). A connection that finds no free slot waits for one. ----
+# slots (siteConnections, or its line in siteLimits; 0 = no limit). A connection that finds no free slot waits for
+# one. A site with no limit still gets a halved one for a while when it answers 429 or 503. ----
 SLOW_CODES = (429, 503)  # the server asks us to slow down
 SLOW_WAIT = 10  # seconds to wait after a slow down answer without a Retry-After header
 SLOW_KEEP = 600  # seconds a halved site limit is kept after the site's last slow down answer
 SLOW_DOWN = "site asked to slow down"  # job detail while waiting for the site
+NO_LIMIT = 10 ** 6  # the connections a site with no limit may have
 DROP = 0.5  # the site got at least this much slower after a connection was added: no more connections for it
 # site -> used (connections open), waiting (connections waiting for a slot), limit (halved limit, None = the setting),
 #   hit (time of the last slow down answer), until (no new connection before this time),
@@ -437,9 +444,14 @@ def site_key(url):
     return host
 
 
+def site_setting(site):
+    """The site's limit from the settings: its per-site line, else siteConnections; NO_LIMIT for 0."""
+    return site_limits().get(site, settings["siteConnections"]) or NO_LIMIT
+
+
 def site_allowed(site, s):
     """How many connections the site may have now: the setting, halved after slow downs, capped after a speed drop."""
-    allowed = site_limits().get(site, settings["siteConnections"])
+    allowed = site_setting(site)
     if s["limit"] and time.time() - s["hit"] > SLOW_KEEP:
         s["limit"] = None  # the site has not complained for a while
     return min(allowed, s["limit"] or allowed, s["cap"] or allowed)
@@ -456,7 +468,7 @@ def site_room(site):
     with site_lock:
         s = sites.get(site)
         if not s:
-            return site_limits().get(site, settings["siteConnections"])
+            return site_setting(site)
         if time.time() < s["until"]:
             return 0
         return max(0, site_allowed(site, s) - s["used"] - s["waiting"])
@@ -529,13 +541,15 @@ def retry_after(value):
 
 def slow_down(site, error, job):
     """The site answered 429 or 503: halve its connection limit and wait for its Retry-After (or SLOW_WAIT).
-    The parts that get the same answer at the same time halve it only once."""
+    The parts that get the same answer at the same time halve it only once. A site with no limit gets one:
+    half the connections it has open now (this one too, it is handed back later)."""
     wait = retry_after(error.headers.get("Retry-After") if error.headers else None)
     with site_lock:
         s = sites[site]
         now = time.time()
         if now >= s["until"]:
-            s["limit"] = max(1, site_allowed(site, s) // 2)
+            allowed = site_allowed(site, s)
+            s["limit"] = max(1, (s["used"] if allowed == NO_LIMIT else allowed) // 2)
             s["hit"] = now
             log("  %s asked to slow down (HTTP %d): %d connections now, waiting %.0fs"
                 % (site, error.code, s["limit"], wait), job)
@@ -1580,26 +1594,34 @@ def drop_private():
             remove_parts(jobs[job_id])
 
 
-def start(job_id):
-    """Put one job at the end of the queue. It runs as soon as there is room."""
+def start(job_id, queued=True):
+    """Put one job at the end of the queue; it runs as soon as there is room. queued=False: it runs right away
+    (from the browser, Add URL, one row's Resume or Retry) and does not count in maxJobs."""
     with lock:
+        live[job_id]["queued"] = queued
+        if not queued:
+            jobs[job_id]["state"] = "running"
+            threading.Thread(target=run, args=(job_id,), daemon=True).start()
+            return
         jobs[job_id]["state"] = "queued"
         queue.append(job_id)
     pump()
 
 
 def pump():
-    """Start queued jobs, first in line first, until the allowed number is running."""
+    """Start queued jobs, first in line first, until maxJobs of the queue's jobs are running."""
     with lock:
-        while queue and sum(job["state"] == "running" for job in jobs.values()) < max(1, int(settings["maxJobs"])):
+        while queue and sum(job["state"] == "running" and live[x].get("queued") for x, job in jobs.items()) \
+                < max(1, int(settings["maxJobs"])):
             job_id = queue.pop(0)
             jobs[job_id]["state"] = "running"
             threading.Thread(target=run, args=(job_id,), daemon=True).start()
 
 
 def add(msg):
-    """New download from the browser: make the job and start it. Returns the job id, or, when the
-    same file was already downloaded (and msg has no "force"), a dict that describes that download."""
+    """New download from the browser: make the job and start it, right away, or in the queue when msg has
+    "queue" (Download all links). Returns the job id, or, when the same file was already downloaded (and msg
+    has no "force"), a dict that describes that download."""
     url = msg.get("url", "").strip().replace(" ", "%20")  # a pasted link may have spaces
     path = urllib.parse.urlsplit(url).path
     is_stream = msg.get("kind") in ("hls", "dash") or path.lower().endswith((".m3u8", ".mpd"))
@@ -1642,7 +1664,7 @@ def add(msg):
                         "added": time.time(), "finished": None, "variant": variant, "subtitles": subtitles,
                         "subFormat": "srt" if msg.get("subFormat") == "srt" else "vtt", "audioOnly": audio,
                         "refresh": False, "sha256": "", "hashing": None, "private": private, "scan": "", "threat": ""}
-        live[job_id] = {"stop": "", "proc": None, "cookies": msg.get("cookies", "")}
+        live[job_id] = {"stop": "", "proc": None, "cookies": msg.get("cookies", ""), "queued": bool(msg.get("queue"))}
         job = jobs[job_id]
         log("job %s: %s from %s%s" % (job_id, name, urllib.parse.urlsplit(url).hostname or "?",
                                       " (page %s)" % site_of(job) if job["referrer"] else ""), job)
@@ -1650,7 +1672,7 @@ def add(msg):
             jobs[job_id]["detail"] = "choose where to save"
             threading.Thread(target=ask_path, args=(job_id,), daemon=True).start()
         else:
-            start(job_id)
+            start(job_id, live[job_id]["queued"])
     save_history()
     return job_id
 
@@ -1728,7 +1750,7 @@ def control(msg):
                 ctl["cookies"] = msg["cookies"]
             if msg.get("userAgent"):
                 job["userAgent"] = msg["userAgent"]
-            start(job_id)
+            start(job_id, bool(msg.get("queue")))  # queue: Start all, the scheduler, the tray
         elif action == "delete" and state not in ACTIVE:
             remove_parts(job)
             if msg.get("deleteFile") and os.path.isfile(job["path"]):
@@ -1781,7 +1803,7 @@ def refresh(msg):
             with open(state_path, "w") as f:
                 json.dump(state, f)
         log("refreshed link of %s: %s" % (job["name"], url), job)
-        start(job_id)
+        start(job_id, False)
     save_history()
     return None
 
@@ -1964,7 +1986,8 @@ def import_backup(msg):
         if not good:
             return "stats line %d of the backup is broken; nothing was changed" % n
     # private mode stays as it is now: a backup made while it was on does not switch it on here
-    error = change_settings({k: v for k, v in new_settings.items() if k not in ("privateMode", "proxyPassword")})
+    error = change_settings({k: v for k, v in upgrade_settings(new_settings).items()
+                             if k not in ("privateMode", "proxyPassword")})
     if error:
         return error
 
@@ -2102,7 +2125,7 @@ def all_jobs(action):
     """Scheduler and tray icon: "resume" every paused or stopped job, or "pause" every running or queued job."""
     states = ("paused", "stopped") if action == "resume" else ACTIVE
     for job_id in [x for x, job in list(jobs.items()) if job["state"] in states]:
-        error = control({"type": action, "id": job_id})
+        error = control({"type": action, "id": job_id, "queue": True})
         if error:
             log("scheduler: %s" % error)
 
@@ -2192,8 +2215,8 @@ def change_settings(new, save=True):
     if merged["proxyMode"] == "manual" and not (clean_host(merged["proxyHost"]) and 0 < merged["proxyPort"] < 65536):
         return "a manual proxy needs an address and a port from 1 to 65535"
     for key, value in new.items():
-        if key not in settings or type(value) is not type(settings[key]):
-            continue  # unknown name or wrong kind of value
+        if key not in settings or type(value) is not type(settings[key]) or key == "settingsVersion":
+            continue  # unknown name or wrong kind of value; the version is always this one
         if key == "folder" and value:
             try:
                 os.makedirs(value, exist_ok=True)
@@ -2205,8 +2228,10 @@ def change_settings(new, save=True):
             return "a time must look like 14:30, not %s" % value
         if key == "autoClean" and value not in AUTO_CLEAN:
             return "Auto clean must be one of: %s days" % ", ".join(map(str, AUTO_CLEAN))
-        if key in ("maxJobs", "parts", "siteConnections"):
+        if key in ("maxJobs", "parts"):
             value = min(max(value, 1), 32)
+        if key == "siteConnections":
+            value = min(max(value, 0), 32)
         if key == "siteLimits":
             for line in filter(str.strip, value.splitlines()):
                 site, equals, number = line.partition("=")
@@ -2233,6 +2258,14 @@ def change_settings(new, save=True):
     return None
 
 
+def upgrade_settings(saved):
+    """Settings from an older UDM (settings.json or a backup): the old default of 8 connections per site
+    becomes the new one, no limit. A value the user changed is kept."""
+    if not isinstance(saved.get("settingsVersion"), int) and saved.get("siteConnections") == 8:
+        saved = {**saved, "siteConnections": 0}
+    return saved
+
+
 def load_settings():
     """Read settings.json if it is there and newer than what we have. Called at startup and by tick()."""
     global settings_time
@@ -2243,11 +2276,12 @@ def load_settings():
     try:
         with open(path, encoding="utf-8") as f:
             saved = json.load(f)
-        error = change_settings(saved, save=False)
+        upgraded = upgrade_settings(saved)
+        error = change_settings(upgraded, save=False)
         log("settings loaded from %s%s" % (path, ": " + error if error else ""))
         # an older settings.json lacks the newer settings: they keep their defaults, written back to the file
         missing = [key for key in settings if key not in saved]
-        if missing:
+        if missing or upgraded != saved:
             change_settings({}, save=True)
             log("defaults added to %s: %s" % (path, ", ".join(missing)))
     except Exception as e:

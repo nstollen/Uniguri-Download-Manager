@@ -248,8 +248,10 @@ Resume starts it again from the beginning.
 
 ## Queue and limits
 
-- At most 3 downloads run at the same time (change it with **Downloads at once**). The rest
-  have the status `queued, place N` and start in order when a place is free.
+- Downloads from the browser and **Add URL** start right away. Downloads that go through the queue
+  (queued and scheduled downloads, **Start all**, **Download all links**) run at most 3 at the same
+  time (change it with **Downloads at once**). The rest have the status `queued, place N` and start
+  in order when a place is free.
 - **Speed limit** is for all direct downloads together; **Limit** on a row is for one download.
   Both are in KB/s, 0 = off. Streams are not limited (ffmpeg does its own downloading).
 - **Parts per download** (default 8) is the most connections one download uses at the same time.
@@ -392,8 +394,9 @@ lines. Running, queued and paused downloads are never touched.
 | Download folder | `%USERPROFILE%\Downloads\udm` |
 | Ask where to save before each download | off |
 | Sort files into subfolders by type, and the extension list of each folder | on |
-| Downloads at the same time | 3 |
+| Downloads at the same time (the queue) | 3 |
 | Parts per download | 8 |
+| Connections per site | 0 (no limit) |
 | Speed limit, KB/s | 0 (off) |
 | Windows notification when a download finishes or fails | on |
 | Bandwidth schedule: limit KB/s from a time to a time | off (500 KB/s, 09:00 to 18:00) |

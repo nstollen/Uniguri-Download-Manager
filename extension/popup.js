@@ -369,7 +369,7 @@ async function downloadSelected(tab) {
   let added = 0, already = 0;
   const failed = [];
   for (const link of picked) {
-    const reply = await chrome.runtime.sendMessage({ type: "download", url: link.url, referrer: tab.url || "", incognito });
+    const reply = await chrome.runtime.sendMessage({ type: "download", url: link.url, referrer: tab.url || "", incognito, queue: true });
     if (reply && reply.ok) added++, (link.box.checked = false);
     else if (reply && reply.duplicate) already++, (link.box.checked = false);
     else failed.push(link.name + ": " + ((reply && reply.error) || "no reply"));

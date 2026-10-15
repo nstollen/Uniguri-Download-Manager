@@ -81,9 +81,9 @@
 
   <section>
     <h2>Downloads</h2>
-    <label class="line"><span>Downloads at the same time</span><input type="number" id="maxJobs" min="1" max="32"></label>
+    <label class="line"><span>Downloads at the same time</span><input type="number" id="maxJobs" min="1" max="32"> <span class="hint">For the queue: queued and scheduled downloads, Start all, Download all links. Downloads from the browser and Add URL start right away.</span></label>
     <label class="line"><span>Parts per download</span><input type="number" id="parts" min="1" max="32"></label>
-    <label class="line"><span>Connections per site</span><input type="number" id="siteConnections" min="1" max="32"> <span class="hint">All parts of all downloads from one site together. More parts wait for a free connection.</span></label>
+    <label class="line"><span>Connections per site</span><input type="number" id="siteConnections" min="0" max="32"> <span class="hint">0 = no limit. All parts of all downloads from one site together. More parts wait for a free connection.</span></label>
     <label class="line top"><span>Per-site limits</span><textarea id="siteLimits" rows="3" spellcheck="false" placeholder="one per line, like: some-site.com = 2 (its subdomains too)"></textarea></label>
     <div class="hint">When a site answers "too many requests" (429 or 503), UDM halves its connections and waits before going on.</div>
     <label class="line"><span>Speed limit, KB/s</span><input type="number" id="speedLimit" min="0"> <span class="hint">0 = no limit. Applies to direct files, not to streams.</span></label>

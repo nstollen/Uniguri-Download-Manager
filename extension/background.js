@@ -392,8 +392,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // variant, subtitles, subFormat: picked in the popup for a stream. audioOnly: the MP3 button.
     // force: "Download again" after the duplicate check. ask: the page asks about duplicates itself.
     // incognito: the popup's tab is in an incognito window, so the download is private
-    const { kind, title, variant, subtitles, subFormat, audioOnly, force } = msg;
-    const extra = { kind, title, variant, subtitles, subFormat, audioOnly, force, private: !!msg.incognito };
+    // queue: Download all links, it waits for its turn ("Downloads at once"); everything else starts right away
+    const { kind, title, variant, subtitles, subFormat, audioOnly, force, queue } = msg;
+    const extra = { kind, title, variant, subtitles, subFormat, audioOnly, force, queue, private: !!msg.incognito };
     handOff(msg.url, msg.referrer, extra, msg.ask).then(sendResponse);
     return true; // reply comes later
   } else if (msg.type === "probe") {

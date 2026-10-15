@@ -483,7 +483,7 @@ for (const [button, action, states] of [["startAll", "resume", ["paused", "stopp
   document.getElementById(button).onclick = async () => {
     const reply = await chrome.runtime.sendMessage({ type: "status" });
     for (const job of Object.values((reply && reply.jobs) || {})) {
-      if (states.includes(job.state)) await control(action, job.id);
+      if (states.includes(job.state)) await control(action, job.id, { queue: true }); // Start all goes through the queue
     }
     show();
   };
