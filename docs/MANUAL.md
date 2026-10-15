@@ -172,7 +172,7 @@ Table columns: name, size, progress bar, speed, time left, status, date added, b
 
 | Button | What it does |
 | --- | --- |
-| Pause / Resume | Direct files: stops the part threads, keeps the `.partN` files and the progress json, continues from there. |
+| Pause / Resume | Direct files: stops the part threads, keeps the `.part` file and the progress json, continues from there. |
 | Stop / Restart | Streams only. ffmpeg cannot pause, so **Stop** ends the download and **Restart** downloads it again from the beginning. |
 | Cancel | Stops the job and deletes its part files. The job stays in the list as `canceled`. |
 | Retry | For failed and canceled jobs. Same url, referrer and user agent, with fresh cookies from the browser. A failed direct file continues from its saved parts. |
@@ -253,12 +253,21 @@ Resume starts it again from the beginning.
 - **Speed limit** is for all direct downloads together; **Limit** on a row is for one download.
   Both are in KB/s, 0 = off. Streams are not limited (ffmpeg does its own downloading).
 - **Parts per download** (default 8) is the most connections one download uses at the same time.
-- **Dynamic segmentation.** When a part finishes early, the part with the most time left (bytes
-  left / its own speed) is split in half and a new connection takes the second half. Parts with
-  less than 1 MB left are not split. The number of connections never goes over **Parts per
-  download**; the number of part files can (`name.part0`, `name.part1`, ... are merged in byte
-  order). This also means a resumed download whose other parts are done uses all its connections
-  on what is left.
+- **One file, no merge.** A direct download is written into one file, `name.part`, which gets its
+  full size at the start (a full disk shows right away). Every connection writes its part at its own
+  place in it, and the finished file is only renamed, so there is no merge step at the end.
+  `name.progress.json` says which bytes are there. Progress saved by an older UDM (`name.part0`,
+  `name.part1`, ...) is copied into the one file once, when it is resumed.
+- **No separate size check.** The first request asks for the whole file. Its answer gives the size
+  and says whether ranges work, and the same connection goes on downloading the first part.
+- **Dynamic segmentation.** Right after that first answer the file is cut into even parts, one
+  connection each. When a part finishes early, the part with the most time left (bytes left / its
+  own speed) is split in half and a new connection takes the second half; several free connections
+  are used at once. A part is only split when it has at least 512 KB and a while to go (1 second,
+  or 6 times what the first answer took on that site: a new connection needs its own answer and
+  starts slow). So tiny files use one connection. The number of connections never goes over
+  **Parts per download**; the number of parts can. A resumed download whose other parts are done
+  uses all its connections on what is left.
 - A part whose connection breaks is tried again up to 3 times. After that the job fails with the
   reason; **Retry** continues from what is saved.
 
@@ -448,7 +457,7 @@ catches a download when the browser knows its file name and size (`downloads.onD
 
 - **Downloader only:** `python downloader\downloader.py https://www.python.org/ftp/python/3.12.0/python-3.12.0-amd64.exe`
   (saved to the `programs` folder; this mode does not write history).
-- **Resume:** start the same command, press Ctrl+C part-way, run it again. It continues from the `.partN` files.
+- **Resume:** start the same command, press Ctrl+C part-way, run it again. It continues from the `.part` file and its progress json.
 - **Whole chain:** with the downloader running, click any download link in Chrome. The browser's
   download disappears and the download shows in the popup and on the manager page.
 
@@ -542,9 +551,10 @@ use playlists this can read.
   `log()` writes each log line (time first, addresses cut down to their site, nothing for private
   jobs). `clear_data()` deletes by time range, kind and site; Clear data, Forget site and Auto clean
   all use it, and its dry run gives the counts the dialogs show.
-  For a direct file it asks for the first byte with a `Range` header. A `206` reply means ranges
-  work, so it splits the file into parts, writes `name.part0..7`, saves progress to
-  `name.progress.json`, then merges. Otherwise it does a normal single download.
+  For a direct file it asks for everything from the first missing byte with a `Range` header. A `206`
+  reply means ranges work: that connection goes on as the first part, the file is split into parts
+  that all write into one pre-sized `name.part`, progress goes to `name.progress.json`, and the
+  finished file is renamed. Otherwise it does a normal single download, reading the same reply.
   Messages it does not know are refused, so they can never start a download by accident.
 
 ## Credits

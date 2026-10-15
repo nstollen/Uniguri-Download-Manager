@@ -7,7 +7,6 @@ python downloader.py <url>    -> download one file or stream right now (for test
 import atexit
 import base64
 import collections
-import contextlib
 import ctypes
 import email.utils
 import glob
@@ -55,7 +54,8 @@ OUT_DIR = os.environ.get("UDM_DIR") or os.path.join(os.path.expanduser("~"), "Do
 DATA_DIR = OUT_DIR  # history.json and settings.json live here, also when the download folder is changed
 NO_FFMPEG = "ffmpeg not found, run: winget install ffmpeg"
 WINDOW = 5  # seconds of history used for speed and time left
-MIN_SPLIT = 1024 * 1024  # dynamic segmentation: a part is only split when at least this much is left
+MIN_SPLIT = 512 * 1024  # dynamic segmentation: a part is only split when at least this much is left
+SPLIT_TIME = 1.0  # ... and it would take at least this many seconds more (or 6 times a new connection's setup)
 EXPIRED_CODES = (403, 404, 410)  # a direct download that fails with one of these can get a refreshed link
 ACTIVE = ("running", "queued")  # states of a job that is downloading or waiting for its turn
 # what the user can change on the settings page; kept in settings.json.
@@ -245,8 +245,7 @@ def load_history():
         if state in ACTIVE:  # the downloader was closed in the middle
             state = "stopped" if is_stream else "paused"
         if state == "paused":
-            # the part files on disk are the truth about how much we already have
-            job["done"] = sum(os.path.getsize(x) for x in glob.glob(glob.escape(source(job)) + ".part[0-9]*"))
+            job["done"] = saved_bytes(job)
         total = row.get("size")
         job.update(state=state, detail=row.get("error") or "", total=total, speed=0, eta=None,
                    percent=100.0 * job["done"] / total if total and not is_stream else None,
@@ -352,6 +351,19 @@ def source(job):
     return job["path"] + ".video" if job.get("audioOnly") and job["kind"] == "file" else job["path"]
 
 
+def saved_bytes(job):
+    """How much of a paused direct download is on disk: the progress json says so for the one download file,
+    the part files themselves for progress saved by an older UDM (one file per part)."""
+    try:
+        with open(source(job) + ".progress.json") as f:
+            state = json.load(f)
+        if state.get("layout") == "one" and os.path.exists(source(job) + ".part"):
+            return sum(p["done"] for p in state["parts"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return sum(os.path.getsize(x) for x in glob.glob(glob.escape(source(job)) + ".part[0-9]*"))
+
+
 def remove_parts(job):
     """Delete what an unfinished job left on disk: part files and the progress json."""
     left = glob.glob(glob.escape(source(job)) + ".part*") + glob.glob(glob.escape(source(job)) + ".progress.json*")
@@ -439,17 +451,20 @@ def site_slowed(site):
         return site in sites and time.time() < sites[site]["until"]
 
 
-def site_free(site):
-    """True when a new connection to the site could start right now."""
+def site_room(site):
+    """How many new connections to the site could start right now."""
     with site_lock:
         s = sites.get(site)
-        return not s or (time.time() >= s["until"] and s["used"] + s["waiting"] < site_allowed(site, s))
+        if not s:
+            return site_limits().get(site, settings["siteConnections"])
+        if time.time() < s["until"]:
+            return 0
+        return max(0, site_allowed(site, s) - s["used"] - s["waiting"])
 
 
-@contextlib.contextmanager
-def site_slot(job, ctl):
-    """Hold one of the site's connection slots, waiting until one is free and any slow down wait is over.
-    Gives the site, or None when the job was paused or canceled while it waited."""
+def site_take(job, ctl):
+    """Take one of the site's connection slots, waiting until one is free and any slow down wait is over.
+    Gives the site, or None when the job was paused or canceled while it waited. site_give() hands it back."""
     site = site_key(job["url"])
     with site_lock:
         s = sites.setdefault(site, {"used": 0, "waiting": 0, "limit": None, "hit": 0, "until": 0, "cap": None,
@@ -466,17 +481,17 @@ def site_slot(job, ctl):
             if busy and s["used"] and not s["check"] and not s["cap"]:
                 s["check"] = {"at": now, "speed": s["speed"], "used": s["used"]}
             s["used"] += 1
-    if not got:
-        yield None
-        return
-    try:
-        yield site
-    finally:
-        with site_lock:
-            s["used"] -= 1
-            if not s["used"] and not s["waiting"]:  # the site is idle: its next download measures speed afresh
-                s.update(cap=None, check=None, samples=[], sampled=0, speed=0.0)
-            site_lock.notify_all()
+    return site if got else None
+
+
+def site_give(site):
+    """Hand back a slot taken with site_take()."""
+    with site_lock:
+        s = sites[site]
+        s["used"] -= 1
+        if not s["used"] and not s["waiting"]:  # the site is idle: its next download measures speed afresh
+            s.update(cap=None, check=None, samples=[], sampled=0, speed=0.0)
+        site_lock.notify_all()
 
 
 def site_count(site, n, job):
@@ -528,24 +543,32 @@ def slow_down(site, error, job):
     job["detail"] = SLOW_DOWN
 
 
-def fetch_part(job, headers, path, part, ctl, guard):
-    """Append bytes to one part file until its range is complete or the job is told to stop.
-    The end of the range can move closer while this runs (dynamic segmentation): guard is held
+def fetch_part(job, headers, path, part, ctl, guard, first=None, wake=None):
+    """Write one part's bytes at its place in the download file until its range is complete or the job is told
+    to stop. The end of the range can move closer while this runs (dynamic segmentation): guard is held
     while it changes, and while bytes are counted, so no byte past the new end is ever written.
-    Each try holds one of the site's connection slots; a slow down answer (429, 503) is not a failed try."""
+    first is (response, site) when the size check's connection is already reading this part's bytes; it holds a
+    site slot, like every other try. A slow down answer (429, 503) is not a failed try. wake is set at the end."""
     left = lambda: part["end"] - part["start"] + 1 - part["done"]  # noqa: E731
     attempt = 0
-    while attempt <= RETRIES and left() > 0 and not ctl["stop"]:
-        failed = False
-        with site_slot(job, ctl) as site:
-            if site is None:
-                return
+    try:
+        while attempt <= RETRIES and left() > 0 and not ctl["stop"]:
+            failed = False
+            if first:
+                (r, site), first = first, None
+            else:
+                r, site = None, site_take(job, ctl)
+                if site is None:
+                    return
             try:
-                rng = "bytes=%d-%d" % (part["start"] + part["done"], part["end"])
-                req = urllib.request.Request(job["url"], headers={**headers, "Range": rng})
-                with urllib.request.urlopen(req, timeout=30) as r, open(path, "ab") as f:
+                if r is None:
+                    rng = "bytes=%d-%d" % (part["start"] + part["done"], part["end"])
+                    req = urllib.request.Request(job["url"], headers={**headers, "Range": rng})
+                    r = urllib.request.urlopen(req, timeout=30)
+                with r, open(path, "r+b", buffering=0) as f:
                     if r.status != 206:
                         raise IOError("server ignored the range request (status %d)" % r.status)
+                    f.seek(part["start"] + part["done"])
                     while left() > 0 and not ctl["stop"]:
                         # small reads while a speed limit is on, so the limit is smooth
                         chunk = 8192 if job["limit"] or current_limit() else CHUNK
@@ -561,14 +584,22 @@ def fetch_part(job, headers, path, part, ctl, guard):
             except Exception as e:
                 if getattr(e, "code", None) in SLOW_CODES:
                     slow_down(site, e, job)
-                    continue  # wait for the site (in site_slot), then the same try again
+                    continue  # wait for the site (in site_take), then the same try again
                 ctl["error"] = str(e) or repr(e)
                 ctl["code"] = getattr(e, "code", None)  # the http status, for Refresh link
                 log("  part at byte %d failed (try %d of %d): %s" % (part["start"], attempt + 1, 1 + RETRIES, e), job)
                 failed = True
-        attempt += 1
-        if failed:
-            time.sleep(1)
+            finally:
+                site_give(site)
+            attempt += 1
+            if failed:
+                time.sleep(1)
+    finally:
+        if first:  # stopped before the open response was read
+            first[0].close()
+            site_give(first[1])
+        if wake:
+            wake.set()
 
 
 def download(job, ctl):
@@ -591,35 +622,72 @@ def download(job, ctl):
                    percent=100.0 * done / total if total else None,
                    eta=(total - done) / speed if total and speed > 0 else None)
 
-    # ---- check range support and size: ask for the first byte only ----
-    # A 206 reply proves ranges work (same meaning as Accept-Ranges: bytes),
-    # and Content-Range carries the full length.
+    # ---- saved progress: where the first missing byte is ----
+    state = None
+    if os.path.exists(state_path):
+        try:
+            with open(state_path) as f:
+                state = json.load(f)
+        except (OSError, ValueError):
+            state = None
+    gaps = [p["start"] + p["done"] for p in (state or {}).get("parts", []) if p["start"] + p["done"] <= p["end"]]
+    at = min(gaps) if gaps else 0
+
+    # ---- check range support and size, and start downloading in the same request ----
+    # The request asks for everything from the first missing byte on. A 206 reply proves ranges work (same
+    # meaning as Accept-Ranges: bytes) and Content-Range carries the full length; the connection then simply
+    # goes on reading as the first part, so no round trip is spent on a separate size check.
     size = 0
+    first = None  # (response, site): the open size check, handed to the part (or single download) that uses it
+    setup = 0.0  # seconds from asking to the answer: what a new connection costs on this site
     while True:  # again after a slow down answer
-        with site_slot(job, ctl) as site:
-            if site is None:
-                return "stopped"
-            job["detail"] = ""
+        site = site_take(job, ctl)
+        if site is None:
+            return "stopped"
+        job["detail"] = ""
+        try:
+            probe = urllib.request.Request(url, headers={**headers, "Range": "bytes=%d-" % at})
+            asked = time.time()
+            r = urllib.request.urlopen(probe, timeout=30)
+            setup = time.time() - asked
+        except urllib.error.HTTPError as e:
+            site_give(site)
+            if e.code in SLOW_CODES:
+                slow_down(site, e, job)
+                continue
+            ctl["code"] = e.code
+            if job["done"]:  # already started: the saved parts are worth more than a fresh single download
+                return "%s (the link may have expired)" % e
+            log("server refused the range check (HTTP %d), trying a single download" % e.code, job)
+            break
+        except Exception as e:
+            site_give(site)
+            # network trouble, not a "no ranges" answer: stop here so saved parts stay resumable
+            return "cannot reach server: %s. Resume to try again." % e
+        first = (r, site)
+        if r.status == 206:
             try:
-                probe = urllib.request.Request(url, headers={**headers, "Range": "bytes=0-0"})
-                with urllib.request.urlopen(probe, timeout=30) as r:
-                    if r.status == 206:
-                        size = int(r.headers["Content-Range"].split("/")[1])
-                    else:
-                        log("no range support (Accept-Ranges: %s, Content-Length: %s)"
-                            % (r.headers.get("Accept-Ranges"), r.headers.get("Content-Length")), job)
-            except urllib.error.HTTPError as e:
-                if e.code in SLOW_CODES:
-                    slow_down(site, e, job)
-                    continue
-                ctl["code"] = e.code
-                if job["done"]:  # already started: the saved parts are worth more than a fresh single download
-                    return "%s (the link may have expired)" % e
-                log("server refused the range check (HTTP %d), trying a single download" % e.code, job)
-            except Exception as e:
-                # network trouble, not a "no ranges" answer: stop here so saved parts stay resumable
-                return "cannot reach server: %s. Resume to try again." % e
+                where, _, total = r.headers["Content-Range"].partition(" ")[2].partition("/")
+                if int(where.split("-")[0]) == at:
+                    size = int(total)
+            except (AttributeError, ValueError):
+                pass
+        if not size:
+            log("no range support (Accept-Ranges: %s, Content-Length: %s)"
+                % (r.headers.get("Accept-Ranges"), r.headers.get("Content-Length")), job)
+            if r.status != 200:  # not the whole file from byte 0: no use for a single download
+                r.close()
+                site_give(site)
+                first = None
         break
+
+    def drop_first():
+        """Close the size check's connection when nobody is going to read it."""
+        nonlocal first
+        if first:
+            first[0].close()
+            site_give(first[1])
+            first = None
 
     def no_room(need):
         """An error message when the disk cannot take `need` more bytes, else None."""
@@ -629,37 +697,43 @@ def download(job, ctl):
                     % (need / 1048576, free / 1048576, os.path.splitdrive(target)[0] or os.path.dirname(target)))
 
     # ---- no ranges: normal single download (pause works, but resume starts it again) ----
-    if size < parts:
+    if not size:
         log("single download: %s" % name, job)
         while True:  # again after a slow down answer
-            with site_slot(job, ctl) as site:
+            if first:  # the size check already got the whole file from byte 0: keep reading it
+                (r, site), first = first, None
+            else:
+                r, site = None, site_take(job, ctl)
                 if site is None:
                     return "stopped"
-                job["detail"] = ""
-                try:
-                    req = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=30) as r, open(target + ".part", "wb") as f:
-                        total = int(r.headers.get("Content-Length") or 0)
-                        if no_room(total):
-                            return no_room(total)
-                        done = last = 0
-                        while not ctl["stop"]:
-                            data = r.read(8192 if job["limit"] or current_limit() else CHUNK)
-                            if not data:
-                                break
-                            f.write(data)
-                            done += len(data)
-                            site_count(site, len(data), job)
-                            throttle(job, ctl, len(data))
-                            if time.time() - last >= 0.5:
-                                report(done, total)
-                                last = time.time()
-                except Exception as e:
-                    if getattr(e, "code", None) in SLOW_CODES:
-                        slow_down(site, e, job)
-                        continue
-                    ctl["code"] = getattr(e, "code", None)
-                    return str(e)
+            job["detail"] = ""
+            try:
+                if r is None:
+                    r = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30)
+                with r, open(target + ".part", "wb") as f:
+                    total = int(r.headers.get("Content-Length") or 0)
+                    if no_room(total):
+                        return no_room(total)
+                    done = last = 0
+                    while not ctl["stop"]:
+                        data = r.read(8192 if job["limit"] or current_limit() else CHUNK)
+                        if not data:
+                            break
+                        f.write(data)
+                        done += len(data)
+                        site_count(site, len(data), job)
+                        throttle(job, ctl, len(data))
+                        if time.time() - last >= 0.5:
+                            report(done, total)
+                            last = time.time()
+            except Exception as e:
+                if getattr(e, "code", None) in SLOW_CODES:
+                    slow_down(site, e, job)
+                    continue
+                ctl["code"] = getattr(e, "code", None)
+                return str(e)
+            finally:
+                site_give(site)
             break
         if ctl["stop"]:
             return "stopped"
@@ -667,74 +741,91 @@ def download(job, ctl):
         log("done: %s (%d bytes, %.1fs)" % (name, os.path.getsize(target), time.time() - started), job)
         return None
 
-    # ---- ranges: load saved progress or plan the parts ----
-    state = None
-    if os.path.exists(state_path):
-        with open(state_path) as f:
-            state = json.load(f)
-        if state.get("url") != url or state.get("size") != size:
-            state = None
-    resumed = state is not None
+    # ---- ranges: saved progress, or one part for the whole file ----
+    # All parts write into one file, name.ext.part, each at its own place, so there is no merge at the end:
+    # the finished file is only renamed. The progress json is the truth about which bytes are there.
+    one = target + ".part"
+    resumed = bool(state and state.get("url") == url and state.get("size") == size and state.get("parts"))
+    legacy = resumed and state.get("layout") != "one"  # saved by an older UDM: one file per part
+    if resumed and not legacy and (not os.path.exists(one) or os.path.getsize(one) != size):
+        resumed = False
     if not resumed:
-        step = size // parts
-        state = {"url": url, "size": size, "parts": [
-            {"start": i * step, "end": size - 1 if i == parts - 1 else (i + 1) * step - 1, "done": 0}
-            for i in range(parts)]}
-
-    paths = ["%s.part%d" % (target, i) for i in range(len(state["parts"]))]
-    for path, part in zip(paths, state["parts"]):
-        # the part file on disk is the truth about how much we already have
-        have = os.path.getsize(path) if os.path.exists(path) else 0
-        if have and (not resumed or have > part["end"] - part["start"] + 1):
-            os.remove(path)
-            have = 0
-        part["done"] = have
+        state = {"url": url, "size": size, "layout": "one", "parts": [{"start": 0, "end": size - 1, "done": 0}]}
+    if no_room(0 if resumed and not legacy else size):
+        drop_first()
+        return no_room(size)
+    if legacy:
+        legacy_parts(target, one, state)
+    elif not resumed:
+        with open(one, "wb") as f:
+            f.truncate(size)  # the whole size at once: a full disk shows now, not halfway
     already = sum(p["done"] for p in state["parts"])
-    log("%s: %s, %d bytes in %d parts (%d bytes already on disk)"
-        % ("resuming" if resumed else "starting", name, size, len(paths), already), job)
+    log("%s: %s, %d bytes, up to %d connections (%d bytes already on disk)"
+        % ("resuming" if resumed else "starting", name, size, parts, already), job)
     job["total"] = size
     save_history()  # the size is known now, keep it for after a restart
-    # room for what is still missing, plus one part: the merge deletes each part once it is copied
-    largest = max(p["end"] - p["start"] + 1 for p in state["parts"])
-    if no_room(size - already + largest):
-        return no_room(size - already + largest)
 
     # ---- process: parallel range requests, progress saved to json ----
     guard = threading.Lock()  # held while a part's range or byte count changes
-    threads = [threading.Thread(target=fetch_part, args=(job, headers, path, part, ctl, guard), daemon=True)
-               for path, part in zip(paths, state["parts"])]
-    for t in threads:
-        t.start()
-    speeds = [[] for _ in threads]  # samples per part, for the speed of each connection
+    wake = threading.Event()  # set when a part's connection ends, so its slot is used again right away
+    threads = {}  # part index -> the thread downloading it
+    speeds = {}  # part index -> samples, for the speed of each connection
+    left_of = lambda i: state["parts"][i]["end"] - state["parts"][i]["start"] + 1 - state["parts"][i]["done"]  # noqa
+
+    def launch(i, given=None):
+        threads[i] = threading.Thread(target=fetch_part, daemon=True, args=(
+            job, headers, one, state["parts"][i], ctl, guard, given, wake))
+        threads[i].start()
+
+    mine = [i for i, p in enumerate(state["parts"]) if p["start"] + p["done"] == at and left_of(i) > 0]
+    if first and mine:
+        launch(mine[0], first)  # the size check's connection goes on as this part
+        first = None
+    drop_first()
+    # A new connection is only worth it when the part it halves has a while to go: the new one first waits for
+    # its answer (the size check shows how long that takes on this site) and then starts slow, the way TCP does.
+    # On a far away server a late split of a small rest was measured to end the download a second later.
+    split_time = max(SPLIT_TIME, 6 * setup)
     last_print = 0
     while True:
-        running = [i for i, t in enumerate(threads) if t.is_alive()]
-        alive = bool(running)
-        # Dynamic segmentation: a connection finished its part early, so the part that will take longest
-        # is split in half and a new connection takes the second half. At most `parts` connections run,
-        # and a part that ended with an error stops the splitting (the job is going to fail anyway).
-        # No split while the site has no free connection: the new half would only wait for one.
         now = time.time()
-        rates = [rate(speeds[i], now, p["done"]) for i, p in enumerate(state["parts"])]
-        failed_part = any(not t.is_alive() and p["done"] < p["end"] - p["start"] + 1
-                          for t, p in zip(threads, state["parts"]))
-        if running and len(running) < parts and not ctl["stop"] and not failed_part and site_free(site_key(url)):
-            with guard:
-                left = {i: state["parts"][i]["end"] - state["parts"][i]["start"] + 1 - state["parts"][i]["done"]
-                        for i in running}
-                slow = max(left, key=lambda i: left[i] / max(rates[i], 1.0))  # most time left
-                if left[slow] >= MIN_SPLIT:
+        rates = {i: rate(speeds.setdefault(i, []), now, p["done"]) for i, p in enumerate(state["parts"])}
+        running = [i for i, t in threads.items() if t.is_alive()]
+        failed_part = any(not t.is_alive() and left_of(i) > 0 for i, t in threads.items())
+        waiting = [i for i in range(len(state["parts"])) if i not in threads and left_of(i) > 0]  # after a resume
+        # More connections, up to `parts` and the site's free slots: a saved part that has no connection gets
+        # one first; otherwise the part that will take longest is split in half and a new connection takes the
+        # second half. Right after the size check that cuts the file into even pieces; later it goes on to the
+        # very end, so a slow last part gets help too. All connections start at once: adding them a few at a
+        # time (IDM's 1, 4, 8) was measured slower on far away servers, where each new connection pays its own
+        # setup and slow start. Too many connections for a site is caught by site_count's speed check instead.
+        # A part that ended with an error stops all of this (the job is going to fail anyway).
+        if not ctl["stop"] and not failed_part:
+            room = min(parts - len(running), site_room(site_key(url)))
+            for _ in range(room):
+                if waiting:
+                    launch(waiting.pop(0))
+                    continue
+                with guard:
+                    worth = {}
+                    known = [rates[i] for i in running if rates.get(i)]
+                    typical = sum(known) / len(known) if known else 0.0  # for a part too new to have a speed
+                    for i in running:
+                        n, speed = left_of(i), rates.get(i) or typical
+                        if n >= MIN_SPLIT and (n / speed >= split_time if speed > 0 else n >= 4 * MIN_SPLIT):
+                            worth[i] = n / max(speed, 1.0)  # time left
+                    if not worth:
+                        break
+                    slow = max(worth, key=worth.get)
                     old = state["parts"][slow]
-                    mid = old["start"] + old["done"] + left[slow] // 2
+                    mid = old["start"] + old["done"] + left_of(slow) // 2
                     state["parts"].append({"start": mid, "end": old["end"], "done": 0})
                     old["end"] = mid - 1
-                    paths.append("%s.part%d" % (target, len(paths)))
-                    speeds.append([])
-                    threads.append(threading.Thread(target=fetch_part, daemon=True, args=(
-                        job, headers, paths[-1], state["parts"][-1], ctl, guard)))
-                    threads[-1].start()
-                    log("  split part %d at byte %d: %d connections, %d parts"
-                        % (slow, mid, len(running) + 1, len(paths)), job)
+                new = len(state["parts"]) - 1
+                launch(new)
+                running.append(new)
+                log("  split part %d at byte %d: %d connections, %d parts"
+                    % (slow, mid, len(running), len(state["parts"])), job)
         with guard:
             with open(state_path + ".tmp", "w") as f:
                 json.dump(state, f)
@@ -742,26 +833,46 @@ def download(job, ctl):
         done = sum(p["done"] for p in state["parts"])
         report(done, size)
         job["detail"] = SLOW_DOWN if site_slowed(site_key(url)) else "%.1f%%" % job["percent"]
-        if time.time() - last_print > 2 or not alive:
+        alive = any(t.is_alive() for t in threads.values())
+        over = not alive and (not waiting or ctl["stop"] or failed_part)
+        if time.time() - last_print > 2 or over:
             log("  %s  %5.1f%%  %d / %d" % (name, 100.0 * done / size, done, size), job)
             last_print = time.time()
-        if not alive:
+        if over:
             break
-        time.sleep(0.5)
+        wake.wait(0.5)
+        wake.clear()
 
-    if done != size:  # paused, canceled, or a part that kept failing: the part files stay for a resume
+    if done != size:  # paused, canceled, or a part that kept failing: the file and json stay for a resume
         return ("a part still failed after %d retries (%s). %d of %d bytes are saved, Retry continues from there."
                 % (RETRIES, ctl.get("error") or "connection closed", done, size))
 
-    # ---- output: merge parts, clean up ----
-    with open(target, "wb") as out:
-        for path, _ in sorted(zip(paths, state["parts"]), key=lambda x: x[1]["start"]):
-            with open(path, "rb") as f:
-                shutil.copyfileobj(f, out, CHUNK)
-            os.remove(path)  # free its space right away
+    # ---- output: the finished file gets its name, clean up ----
+    os.replace(one, target)
     remove_parts(job)
     log("done: %s (%d bytes, %.1fs)" % (name, os.path.getsize(target), time.time() - started), job)
     return None
+
+
+def legacy_parts(target, one, state):
+    """Progress saved by an older UDM, one file per part (name.part0, name.part1 ...): copy what each has
+    into its place in the one download file, then delete them. The part files are the truth here."""
+    with open(one, "wb") as out:
+        out.truncate(state["size"])
+        for i, part in enumerate(state["parts"]):
+            path = "%s.part%d" % (target, i)
+            have = os.path.getsize(path) if os.path.exists(path) else 0
+            if have > part["end"] - part["start"] + 1:
+                have = 0
+            if have:
+                out.seek(part["start"])
+                with open(path, "rb") as f:
+                    shutil.copyfileobj(f, out, 1024 * 1024)
+            part["done"] = have
+    for i in range(len(state["parts"])):
+        if os.path.exists("%s.part%d" % (target, i)):
+            os.remove("%s.part%d" % (target, i))
+    state["layout"] = "one"
 
 
 # ---- proxy: settings page, Network. Every urllib request (direct downloads, playlists, subtitles) goes through
