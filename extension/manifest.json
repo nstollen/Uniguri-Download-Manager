@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Uniguri Download Manager",
-  "version": "2.0",
+  "version": "2.1",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuX/pMDFRlrulq43bKdodbnt29DSMw3tZZ6Kd/Y3vfKCA5qbliDai1UNOoNkUEGoX6ab9CAIFgxC9LrqYgI9u4YDNab86c8h2Zzz5jT6UNXdyxC2DnprECn+LOQ86SkB9mZmy4wSZdlTb+LHHTXcx1o5wOqF8q7VT4hyqJnpwR992FdmtGvwl4jHe2ecXGt88mXlpF7EjDHT+1TpBT2cY8cJmKsWjxJ/mZs/V7MpQkmWq2GP/++mYGmIWwZbOy29ezWnBqgsjBhU7SX0Df4LglQ3S3NQP5t5PuZXioOabakT2aHoo5u1dOUvCBkhEr3gRXUL6J/rrGPr6hoRsDrJWuQIDAQAB",
   "description": "Download manager: hands browser downloads and detected videos to the local UDM downloader.",
   "icons": {

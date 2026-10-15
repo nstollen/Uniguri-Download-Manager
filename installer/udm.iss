@@ -1,5 +1,5 @@
 ; UDM-Setup.exe. build.bat builds the two exes with PyInstaller first, then runs this with Inno Setup 6:
-;   ISCC /DAppVersion=2.0 installer\udm.iss   ->   dist\UDM-Setup.exe
+;   ISCC /DAppVersion=2.1 installer\udm.iss   ->   dist\UDM-Setup.exe
 ;
 ; Installs for the current user only (no admin) to %LOCALAPPDATA%\UDM:
 ;   downloader\  udm-downloader.exe (+ _internal\), ffmpeg.exe, ffprobe.exe if present, udm.ico
