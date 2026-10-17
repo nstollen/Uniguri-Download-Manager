@@ -21,7 +21,7 @@ function fmtTime(seconds) {
   return s + "s";
 }
 
-const STREAM_NOTE = "Streams cannot be paused. Stop ends the download, and Restart downloads it again from the beginning.";
+const STREAM_NOTE = "This stream cannot be paused. Stop ends the download, and Restart downloads it again from the beginning.";
 
 // Send one control action for a job. It goes background script -> native host -> downloader.
 function control(action, id, extra) {
@@ -39,7 +39,9 @@ function scanText(job) {
 
 // The buttons a job can have right now, as [label, action, tooltip].
 function jobButtons(job) {
-  const stream = job.kind === "stream";
+  // an HLS stream that UDM downloads in segments can pause like a file (job.pausable); one that ffmpeg downloads
+  // alone (live, DASH, ...) can only stop
+  const stream = job.kind === "stream" && !job.pausable;
   const list = [];
   if (job.scan === "scanning") return list; // the download is finished: nothing to pause or cancel
   if (job.scan === "threat") {
@@ -48,6 +50,7 @@ function jobButtons(job) {
   }
   if (job.state === "running") {
     list.push(stream ? ["Stop", "pause", STREAM_NOTE] : ["Pause", "pause", "Keeps what is downloaded so far"]);
+    if (job.kind === "stream" && job.pausable) list[list.length - 1][2] = "Keeps the segments downloaded so far";
   }
   if (job.state === "queued") list.push(["Pause", "pause", "Takes it out of the queue"]);
   if (job.state === "paused") list.push(["Resume", "resume", "Continues from where it paused"]);

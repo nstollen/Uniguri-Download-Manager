@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import winreg
+from contextlib import ExitStack
 from ctypes import wintypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -44,6 +46,16 @@ if FROZEN and sys.argv[1:2] == ["-c"]:
     exec(code, {"__name__": "__main__"})
     sys.exit()
 
+# https certificates are checked with Windows' own certificate system (CertGetCertificateChain), like the browser
+# and IDM do: Python's built-in check uses another chain and calls some valid sites "expired". Checking is never
+# turned off. See CheckedHTTPSHandler: every https connection gets its own truststore context.
+try:
+    import truststore
+    CERT_CHECK = "Windows"
+except ImportError:  # run from source without truststore installed: Python's own check, still on
+    truststore = None
+    CERT_CHECK = "Python"
+
 PORT = int(os.environ.get("UDM_PORT") or 8765)  # UDM_PORT and UDM_DIR are only for testing
 CHUNK = 64 * 1024
 RETRIES = 3  # times one part is tried again before the whole job fails
@@ -54,9 +66,12 @@ EXPIRED = "the link may have expired. reload the video page, press play, and dow
 OUT_DIR = os.environ.get("UDM_DIR") or os.path.join(os.path.expanduser("~"), "Downloads", "udm")
 DATA_DIR = OUT_DIR  # history.json and settings.json live here, also when the download folder is changed
 NO_FFMPEG = "ffmpeg not found, run: winget install ffmpeg"
-WINDOW = 5  # seconds of history used for speed and time left
-MIN_SPLIT = 512 * 1024  # dynamic segmentation: a part is only split when at least this much is left
-SPLIT_TIME = 1.0  # ... and it would take at least this many seconds more (or 6 times a new connection's setup)
+WINDOW = 5  # seconds of history used for a site's and a part's speed
+SPEED_WINDOW = 3  # seconds of history for the speed and time left shown in the popup: steady, but quick to follow
+SAVE_EVERY = 1.5  # seconds between two saves of a download's progress json
+MIN_SPLIT = 256 * 1024  # dynamic segmentation: a part is only split when at least this much is left
+SPLIT_TIME = 0.25  # ... and it would take at least this many seconds more (or 2 times a new connection's setup)
+SPLIT_SETUPS = 2  # a split pays off when the rest takes longer than this many connection setups
 EXPIRED_CODES = (403, 404, 410)  # a direct download that fails with one of these can get a refreshed link
 ACTIVE = ("running", "queued")  # states of a job that is downloading or waiting for its turn
 # what the user can change on the settings page; kept in settings.json.
@@ -170,7 +185,8 @@ clock = {}  # job id or "all" -> time when the next chunk may be read (this is h
 #   scan (Windows Defender, after the download): "" (no scan: off, or not finished) | "scanning" | "clean" |
 #     "threat" (the user still has to choose) | "deleted" | "kept" | "trusted" (skipped) | "unavailable" | "failed"
 #   threat (the name Defender gives the threat, or "")
-# "stopped" is a paused stream: ffmpeg cannot pause, so resume starts the stream again.
+# "stopped" is a paused stream that ffmpeg downloads alone: it cannot pause, so resume starts the stream again.
+# An HLS stream whose segments UDM downloads itself (pausable) is "paused" instead and resumes from its segments.
 jobs = {}
 # job id -> things that are never shown or saved:
 #   stop ("" | "pause" | "cancel": what the worker thread should do), proc (ffmpeg), cookies
@@ -187,7 +203,7 @@ STAMP = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) ")  # the time at the sta
 # what history.json keeps of each job. Cookies are never written to disk.
 SAVED = ("id", "name", "kind", "url", "referrer", "userAgent", "title", "path", "done", "elapsed", "limit",
          "notified", "variant", "subtitles", "subFormat", "audioOnly", "refresh", "sha256", "scan", "threat",
-         "named")
+         "named", "pausable")
 
 
 def log(text, job=None):
@@ -198,6 +214,26 @@ def log(text, job=None):
     text = LINK.sub(lambda m: urllib.parse.urlsplit(m.group()).hostname or "(link)", str(text))
     with log_lock:
         print(time.strftime(DATE), text, flush=True)
+
+
+BAD_CERT = "this site's security certificate isn't valid"
+CERT_REASONS = (  # words in Windows' (or Python's) reason -> what it means
+    (("validity period", "expired", "not yet valid"), "it has expired or is not valid yet"),
+    (("CN name", "Hostname mismatch", "match"), "it was made for a different site"),
+    (("not trusted", "self-signed", "self signed", "local issuer", "untrusted"), "it is not from a trusted authority"),
+    (("revoked",), "it was revoked"),
+)
+
+
+def error_text(e):
+    """The message for a failed request: BAD_CERT and why for a certificate that fails the check, else the error."""
+    reason = getattr(e, "reason", None)  # urllib wraps the ssl error in a URLError
+    cert = e if isinstance(e, ssl.SSLCertVerificationError) else reason
+    if isinstance(cert, ssl.SSLCertVerificationError):
+        detail = getattr(cert, "verify_message", "") or " ".join(str(x) for x in cert.args)
+        why = next((text for words, text in CERT_REASONS if any(w.lower() in detail.lower() for w in words)), "")
+        return "%s%s" % (BAD_CERT, " (%s)" % why if why else "")
+    return str(e) or repr(e)
 
 
 def site_of(job):
@@ -250,8 +286,8 @@ def load_history():
         state = row.get("status")
         is_stream = job["kind"] == "stream"
         if state in ACTIVE:  # the downloader was closed in the middle
-            state = "stopped" if is_stream else "paused"
-        if state == "paused":
+            state = "stopped" if is_stream and not job["pausable"] else "paused"
+        if state == "paused" and not is_stream:
             job["done"] = saved_bytes(job)
         total = row.get("size")
         job.update(state=state, detail=row.get("error") or "", total=total, speed=0, eta=None,
@@ -426,10 +462,10 @@ def ask_path(job_id):
     save_history()
 
 
-def rate(samples, now, value):
-    """Add one (time, value) sample and return the average change per second over the last few seconds."""
+def rate(samples, now, value, window=WINDOW):
+    """Add one (time, value) sample and return the average change per second over the last `window` seconds."""
     samples.append((now, value))
-    while len(samples) > 2 and now - samples[1][0] >= WINDOW:
+    while len(samples) > 2 and now - samples[1][0] >= window:
         samples.pop(0)
     span = now - samples[0][0]
     return max(0.0, (value - samples[0][1]) / span) if span > 0 else 0.0
@@ -451,6 +487,29 @@ def source(job):
     return job["path"] + ".video" if job.get("audioOnly") and job["kind"] == "file" else job["path"]
 
 
+def write_json(path, data, tries=4):
+    """Write data to path as json through path.tmp, so a crash never leaves half a file. Windows refuses the
+    rename for a moment while an antivirus or the search indexer has the file open: that is tried again, a little
+    later each time. Returns False when it was still refused after `tries` tries (the old file stays)."""
+    text = json.dumps(data)
+    for attempt in range(tries):
+        try:
+            with open(path + ".tmp", "w") as f:
+                f.write(text)
+            os.replace(path + ".tmp", path)
+            return True
+        except PermissionError:
+            time.sleep(0.05 * (attempt + 1))
+    return False
+
+
+def write_all(f, data):
+    """Write all of data to an unbuffered file (a raw write may take only some of it)."""
+    written = 0
+    while written < len(data):
+        written += f.write(data[written:])
+
+
 def saved_bytes(job):
     """How much of a paused direct download is on disk: the progress json says so for the one download file,
     the part files themselves for progress saved by an older UDM (one file per part)."""
@@ -465,8 +524,10 @@ def saved_bytes(job):
 
 
 def remove_parts(job):
-    """Delete what an unfinished job left on disk: part files and the progress json."""
+    """Delete what an unfinished job left on disk: part files, the progress json, a stream's segments."""
     left = glob.glob(glob.escape(source(job)) + ".part*") + glob.glob(glob.escape(source(job)) + ".progress.json*")
+    if os.path.isdir(segments_dir(job)):
+        shutil.rmtree(segments_dir(job), ignore_errors=True)
     for path in left:
         try:
             os.remove(path)
@@ -654,11 +715,13 @@ def slow_down(site, error, job):
 
 def fetch_part(job, headers, path, part, ctl, guard, first=None, wake=None):
     """Write one part's bytes at its place in the download file until its range is complete or the job is told
-    to stop. The end of the range can move closer while this runs (dynamic segmentation): guard is held
-    while it changes, and while bytes are counted, so no byte past the new end is ever written.
+    to stop. Every part has its own file handle and writes at its own offset, so parts never wait for each other.
+    The end of the range can move closer while this runs (dynamic segmentation): guard, this part's own lock, is
+    held while it changes and while bytes are written and counted, so no byte past the new end is ever written.
     first is (response, site) when the size check's connection is already reading this part's bytes; it holds a
     site slot, like every other try. A slow down answer (429, 503) is not a failed try. wake is set at the end."""
     left = lambda: part["end"] - part["start"] + 1 - part["done"]  # noqa: E731
+    buf = memoryview(bytearray(CHUNK))  # read into the same buffer every time: no new bytes object per read
     attempt = 0
     try:
         while attempt <= RETRIES and left() > 0 and not ctl["stop"]:
@@ -681,22 +744,23 @@ def fetch_part(job, headers, path, part, ctl, guard, first=None, wake=None):
                     while left() > 0 and not ctl["stop"]:
                         # small reads while a speed limit is on, so the limit is smooth
                         chunk = 8192 if job["limit"] or current_limit() else CHUNK
-                        data = r.read(min(chunk, left()))
-                        if not data:
+                        n = r.readinto(buf[:min(chunk, left())])
+                        if not n:
                             break
                         with guard:
-                            data = data[:left()]  # the part may have been split while we were reading
-                            f.write(data)
-                            part["done"] += len(data)
-                        site_count(site, len(data), job)
-                        throttle(job, ctl, len(data))
+                            n = min(n, left())  # the part may have been split while we were reading
+                            write_all(f, buf[:n])
+                            part["done"] += n
+                        site_count(site, n, job)
+                        throttle(job, ctl, n)
             except Exception as e:
                 if getattr(e, "code", None) in SLOW_CODES:
                     slow_down(site, e, job)
                     continue  # wait for the site (in site_take), then the same try again
-                ctl["error"] = str(e) or repr(e)
+                ctl["error"] = error_text(e)
                 ctl["code"] = getattr(e, "code", None)  # the http status, for Refresh link
-                log("  part at byte %d failed (try %d of %d): %s" % (part["start"], attempt + 1, 1 + RETRIES, e), job)
+                log("  part at byte %d failed (try %d of %d): %s" % (part["start"], attempt + 1, 1 + RETRIES,
+                                                                    ctl["error"]), job)
                 failed = True
             finally:
                 site_give(site)
@@ -734,7 +798,7 @@ def download(job, ctl):
     def report(done, total):
         """Store bytes done, speed and time left in the job for the popup."""
         now = time.time()
-        speed = rate(samples, now, done)
+        speed = rate(samples, now, done, SPEED_WINDOW)
         job.update(done=done, total=total or None, speed=speed, elapsed=now - started,
                    percent=100.0 * done / total if total else None,
                    eta=(total - done) / speed if total and speed > 0 else None)
@@ -779,6 +843,8 @@ def download(job, ctl):
             break
         except Exception as e:
             site_give(site)
+            if error_text(e).startswith(BAD_CERT):
+                return error_text(e)
             # network trouble, not a "no ranges" answer: stop here so saved parts stay resumable
             return "cannot reach server: %s. Resume to try again." % e
         first = (r, site)
@@ -834,14 +900,15 @@ def download(job, ctl):
                     if no_room(total):
                         return no_room(total)
                     done = last = 0
+                    buf = memoryview(bytearray(CHUNK))  # one buffer for every read, like fetch_part
                     while not ctl["stop"]:
-                        data = r.read(8192 if job["limit"] or current_limit() else CHUNK)
-                        if not data:
+                        n = r.readinto(buf[:8192 if job["limit"] or current_limit() else CHUNK])
+                        if not n:
                             break
-                        f.write(data)
-                        done += len(data)
-                        site_count(site, len(data), job)
-                        throttle(job, ctl, len(data))
+                        f.write(buf[:n])
+                        done += n
+                        site_count(site, n, job)
+                        throttle(job, ctl, n)
                         if time.time() - last >= 0.5:
                             report(done, total)
                             last = time.time()
@@ -850,7 +917,7 @@ def download(job, ctl):
                     slow_down(site, e, job)
                     continue
                 ctl["code"] = getattr(e, "code", None)
-                return str(e)
+                return error_text(e)
             finally:
                 site_give(site)
             break
@@ -885,7 +952,9 @@ def download(job, ctl):
     save_history()  # the size is known now, keep it for after a restart
 
     # ---- process: parallel range requests, progress saved to json ----
-    guard = threading.Lock()  # held while a part's range or byte count changes
+    # Each part has its own lock, held while its range or byte count changes: only a split of that part (here, in
+    # this thread) ever waits for its connection, the connections never wait for each other.
+    guards = [threading.Lock() for _ in state["parts"]]
     wake = threading.Event()  # set when a part's connection ends, so its slot is used again right away
     threads = {}  # part index -> the thread downloading it
     speeds = {}  # part index -> samples, for the speed of each connection
@@ -893,8 +962,19 @@ def download(job, ctl):
 
     def launch(i, given=None):
         threads[i] = threading.Thread(target=fetch_part, daemon=True, args=(
-            job, headers, one, state["parts"][i], ctl, guard, given, wake))
+            job, headers, one, state["parts"][i], ctl, guards[i], given, wake))
         threads[i].start()
+
+    def save_state(final=False):
+        """Write the progress json from a copy of each part taken under its own lock. A file Windows keeps busy
+        for a moment is tried again: a few times now, longer when it is the last save before a pause."""
+        with ExitStack() as held:
+            for g in guards:
+                held.enter_context(g)
+            snapshot = dict(state, parts=[dict(p) for p in state["parts"]])
+        if not write_json(state_path, snapshot, 20 if final else 4) and final:
+            log("  could not save the progress of %s (the file stays busy), its last saved progress is used"
+                % name, job)
 
     mine = [i for i, p in enumerate(state["parts"]) if p["start"] + p["done"] == at and left_of(i) > 0]
     if first and mine:
@@ -902,10 +982,11 @@ def download(job, ctl):
         first = None
     drop_first()
     # A new connection is only worth it when the part it halves has a while to go: the new one first waits for
-    # its answer (the size check shows how long that takes on this site) and then starts slow, the way TCP does.
-    # On a far away server a late split of a small rest was measured to end the download a second later.
-    split_time = max(SPLIT_TIME, 6 * setup)
-    last_print = 0
+    # its answer (the size check shows how long that takes on this site), then both halves go on at the same time.
+    # With setup s and t seconds left that ends at s + t/2 instead of t: worth it when t > 2s. So only a server that
+    # is very slow to answer keeps a connection from being split near the end.
+    split_time = max(SPLIT_TIME, SPLIT_SETUPS * setup)
+    last_print = last_save = 0
     while True:
         now = time.time()
         rates = {i: rate(speeds.setdefault(i, []), now, p["done"]) for i, p in enumerate(state["parts"])}
@@ -925,19 +1006,22 @@ def download(job, ctl):
                 if waiting:
                     launch(waiting.pop(0))
                     continue
-                with guard:
-                    worth = {}
-                    known = [rates[i] for i in running if rates.get(i)]
-                    typical = sum(known) / len(known) if known else 0.0  # for a part too new to have a speed
-                    for i in running:
-                        n, speed = left_of(i), rates.get(i) or typical
-                        if n >= MIN_SPLIT and (n / speed >= split_time if speed > 0 else n >= 4 * MIN_SPLIT):
-                            worth[i] = n / max(speed, 1.0)  # time left
-                    if not worth:
-                        break
-                    slow = max(worth, key=worth.get)
+                worth = {}
+                known = [rates[i] for i in running if rates.get(i)]
+                typical = sum(known) / len(known) if known else 0.0  # for a part too new to have a speed
+                for i in running:
+                    n, speed = left_of(i), rates.get(i) or typical
+                    if n >= MIN_SPLIT and (n / speed >= split_time if speed > 0 else n >= 4 * MIN_SPLIT):
+                        worth[i] = n / max(speed, 1.0)  # time left
+                if not worth:
+                    break
+                slow = max(worth, key=worth.get)
+                with guards[slow]:  # its connection waits only for these few lines
                     old = state["parts"][slow]
+                    if left_of(slow) < MIN_SPLIT:  # it got close to its end since the check above
+                        break
                     mid = old["start"] + old["done"] + left_of(slow) // 2
+                    guards.append(threading.Lock())
                     state["parts"].append({"start": mid, "end": old["end"], "done": 0})
                     old["end"] = mid - 1
                 new = len(state["parts"]) - 1
@@ -945,15 +1029,16 @@ def download(job, ctl):
                 running.append(new)
                 log("  split part %d at byte %d: %d connections, %d parts"
                     % (slow, mid, len(running), len(state["parts"])), job)
-        with guard:
-            with open(state_path + ".tmp", "w") as f:
-                json.dump(state, f)
-        os.replace(state_path + ".tmp", state_path)
         done = sum(p["done"] for p in state["parts"])
         report(done, size)
         job["detail"] = SLOW_DOWN if site_slowed(site_key(url)) else "%.1f%%" % job["percent"]
         alive = any(t.is_alive() for t in threads.values())
         over = not alive and (not waiting or ctl["stop"] or failed_part)
+        # the json only says which bytes are on disk, so saving it now and then is enough: a crash between two
+        # saves downloads those few seconds again. The last save (pause, failure) has every connection ended.
+        if over and done != size or time.time() - last_save >= SAVE_EVERY:
+            save_state(final=over)
+            last_save = time.time()
         if time.time() - last_print > 2 or over:
             log("  %s  %5.1f%%  %d / %d" % (name, 100.0 * done / size, done, size), job)
             last_print = time.time()
@@ -1115,6 +1200,26 @@ def socks_connection(base, conf):
     return Connection
 
 
+def cert_context():
+    """A new ssl context that checks the site's certificate with Windows (truststore), for one connection only.
+    truststore turns a context's own check off for the moment of each handshake and back on after it, so two
+    connections at the same time must never share a context: one could put back the other's "off" for good.
+    urllib's HTTPSHandler shares one context between all its connections, CheckedHTTPSHandler does not."""
+    if truststore:
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # check_hostname and CERT_REQUIRED by default
+    return ssl.create_default_context()
+
+
+class CheckedHTTPSHandler(urllib.request.HTTPSHandler):
+    """https with a new cert_context() for every connection (direct, through an http proxy, or a SOCKS5 proxy)."""
+    def __init__(self, connection=http.client.HTTPSConnection):
+        super().__init__()
+        self.connection = connection
+
+    def https_open(self, req):
+        return self.do_open(self.connection, req, context=cert_context())
+
+
 class SocksHTTPHandler(urllib.request.HTTPHandler):
     def __init__(self, conf):
         super().__init__()
@@ -1122,15 +1227,6 @@ class SocksHTTPHandler(urllib.request.HTTPHandler):
 
     def http_open(self, req):
         return self.do_open(socks_connection(http.client.HTTPConnection, self.conf), req)
-
-
-class SocksHTTPSHandler(urllib.request.HTTPSHandler):
-    def __init__(self, conf):
-        super().__init__()
-        self.conf = conf
-
-    def https_open(self, req):
-        return self.do_open(socks_connection(http.client.HTTPSConnection, self.conf), req, context=self._context)
 
 
 class HTTPProxyHandler(urllib.request.BaseHandler):
@@ -1154,15 +1250,18 @@ class HTTPProxyHandler(urllib.request.BaseHandler):
 
 
 def proxy_opener(conf):
-    """A urllib opener for this proxy. ProxyHandler({}) keeps urllib from using proxies on its own."""
+    """A urllib opener for this proxy. ProxyHandler({}) keeps urllib from using proxies on its own.
+    Every one checks https certificates with Windows (CheckedHTTPSHandler)."""
     direct = urllib.request.ProxyHandler({})
     if conf["mode"] == "windows":
-        return urllib.request.build_opener(urllib.request.ProxyHandler(urllib.request.getproxies_registry()))
+        return urllib.request.build_opener(urllib.request.ProxyHandler(urllib.request.getproxies_registry()),
+                                           CheckedHTTPSHandler())
     if conf["mode"] == "manual" and conf["type"] == "socks5":
-        return urllib.request.build_opener(direct, SocksHTTPHandler(conf), SocksHTTPSHandler(conf))
+        return urllib.request.build_opener(direct, SocksHTTPHandler(conf), CheckedHTTPSHandler(
+            socks_connection(http.client.HTTPSConnection, conf)))
     if conf["mode"] == "manual":
-        return urllib.request.build_opener(direct, HTTPProxyHandler(conf))
-    return urllib.request.build_opener(direct)
+        return urllib.request.build_opener(direct, HTTPProxyHandler(conf), CheckedHTTPSHandler())
+    return urllib.request.build_opener(direct, CheckedHTTPSHandler())
 
 
 def use_proxy():
@@ -1170,6 +1269,9 @@ def use_proxy():
     global windows_proxy
     windows_proxy = urllib.request.getproxies_registry() if settings["proxyMode"] == "windows" else None
     urllib.request.install_opener(proxy_opener(proxy_conf()))
+
+
+urllib.request.install_opener(urllib.request.build_opener(CheckedHTTPSHandler()))  # until use_proxy() runs
 
 
 def proxy_text(conf):
@@ -1195,6 +1297,8 @@ def test_proxy(form):
         return {"ok": False, "error": "the proxy wants a user name and password (407)" if e.code == 407
                 else "the test page answered %d %s" % (e.code, e.reason)}
     except Exception as e:
+        if error_text(e).startswith(BAD_CERT):
+            return {"ok": False, "error": error_text(e)}
         reason = getattr(e, "reason", None) or e
         return {"ok": False, "error": str(reason) or repr(reason)}
     return {"ok": True, "ms": round((time.time() - started) * 1000), "via": proxy_text(conf)}
@@ -1446,8 +1550,8 @@ def save_subtitles(job, ctl):
             saved.append(os.path.basename(path))
             log("  subtitles saved: %s (%d cues)" % (os.path.basename(path), len(cues)), job)
         except Exception as e:
-            failed.append("%s: %s" % (sub.get("name"), e))
-            log("  subtitles %s failed: %s" % (sub.get("name"), e), job)
+            failed.append("%s: %s" % (sub.get("name"), error_text(e)))
+            log("  subtitles %s failed: %s" % (sub.get("name"), error_text(e)), job)
     note = "%d subtitle%s saved" % (len(saved), "" if len(saved) == 1 else "s") if saved else ""
     if failed:
         note += ("; " if note else "") + "subtitles failed: " + ", ".join(failed)
@@ -1479,6 +1583,370 @@ def to_mp3(job, ctl):
     return None
 
 
+# ---- HLS: UDM reads the playlist of the picked quality and downloads its segments itself, several at once (one
+# connection each, up to "parts per download", like a direct download), keeps the finished ones for pause and
+# resume, and then lets ffmpeg join them without re-encoding (-c copy). ffmpeg still does the decrypting (AES-128)
+# and the fMP4 init sections: it reads a copy of the playlist that points at the downloaded files.
+# What this cannot do goes to ffmpeg alone, the old way: live streams, a quality with a separate audio playlist,
+# SAMPLE-AES, DASH, or a playlist that cannot be read. ----
+SEGMENT_RETRIES = 3  # times one segment is tried again before the download fails (its finished segments stay)
+
+
+def segments_dir(job):
+    """Where the segments of a stream wait to be joined: next to the file, "name.mp4.segments"."""
+    return job["path"] + ".segments"
+
+
+def hls_plan(job, headers):
+    """The segments of the quality to download, or None (with the reason in the log) when ffmpeg should do it alone.
+    Returns {"media": playlist url, "lines": the local playlist, "items": [{url, range, file, seg, duration}]}:
+    items are the files to download (keys, init sections and segments); seg says it is a media segment."""
+    # ---- input: the playlist the browser found (a master playlist or a media playlist) ----
+    def fetch(link):
+        with urllib.request.urlopen(urllib.request.Request(link, headers=headers), timeout=15) as r:
+            return r.geturl(), r.read(8000000).decode("utf-8-sig", "replace")
+
+    def attrs_of(line):
+        return {k: v.strip('"') for k, v in re.findall(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)', line.partition(":")[2])}
+
+    base, text = fetch(job["url"])
+    if not text.lstrip().startswith("#EXTM3U"):
+        log("  %s: not an HLS playlist, ffmpeg gets the stream" % job["name"], job)
+        return None
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+
+    # ---- master playlist: the quality picked in the popup (same order as read_master), else the best one ----
+    variants = [(attrs_of(line), lines[i + 1]) for i, line in enumerate(lines[:-1])
+                if line.startswith("#EXT-X-STREAM-INF") and not lines[i + 1].startswith("#")]
+    if variants:
+        n = job.get("variant")
+        if n is None or not 0 <= n < len(variants):
+            def size(a):
+                w, _, h = a.get("RESOLUTION", "").partition("x")
+                return (int(w or 0) * int(h or 0) if (w + h).isdigit() else 0, int(a.get("BANDWIDTH") or 0))
+            n = max(range(len(variants)), key=lambda i: size(variants[i][0]))
+        attrs, link = variants[n]
+        group = attrs.get("AUDIO")
+        for line in lines:
+            a = attrs_of(line)
+            if line.startswith("#EXT-X-MEDIA") and a.get("TYPE") == "AUDIO" and a.get("GROUP-ID") == group and a.get("URI"):
+                log("  %s: the audio is a separate playlist, ffmpeg gets the stream" % job["name"], job)
+                return None
+        base, text = fetch(urllib.parse.urljoin(base, link))
+        lines = [x.strip() for x in text.splitlines() if x.strip()]
+
+    # ---- media playlist: every segment, key and init section, and the same playlist pointing at local files ----
+    if "#EXT-X-ENDLIST" not in lines:
+        log("  %s: live stream, ffmpeg gets it" % job["name"], job)
+        return None
+    items, local, keys, maps = [], [], {}, {}
+    pending = None  # (length, offset) of an #EXT-X-BYTERANGE for the next segment
+    ends = {}  # url -> where its last byte range ended (a range without @offset goes on from there)
+    duration = 0.0
+    for line in lines:
+        if line.startswith("#EXT-X-KEY"):
+            a = attrs_of(line)
+            method = a.get("METHOD", "NONE")
+            if method not in ("NONE", "AES-128"):
+                log("  %s: %s encryption, ffmpeg gets the stream" % (job["name"], method), job)
+                return None
+            if method == "AES-128":
+                link = urllib.parse.urljoin(base, a["URI"])
+                if link not in keys:
+                    keys[link] = "key%d.key" % len(keys)
+                    items.append({"url": link, "range": None, "file": keys[link], "seg": False, "duration": 0})
+                line = re.sub(r'URI="[^"]*"', 'URI="%s"' % keys[link], line)
+        elif line.startswith("#EXT-X-MAP"):
+            a = attrs_of(line)
+            link = urllib.parse.urljoin(base, a["URI"])
+            rng = None
+            if a.get("BYTERANGE"):
+                length, _, offset = a["BYTERANGE"].partition("@")
+                rng = (int(offset or 0), int(offset or 0) + int(length) - 1)
+            if (link, rng) not in maps:
+                maps[(link, rng)] = "init%d%s" % (len(maps), os.path.splitext(urllib.parse.urlsplit(link).path)[1][:5] or ".mp4")
+                items.append({"url": link, "range": rng, "file": maps[(link, rng)], "seg": False, "duration": 0})
+            line = '#EXT-X-MAP:URI="%s"' % maps[(link, rng)]
+        elif line.startswith("#EXT-X-BYTERANGE"):
+            length, _, offset = line.partition(":")[2].partition("@")
+            pending = (int(length), int(offset) if offset else None)
+            continue  # each downloaded segment is exactly its range: the local playlist has no ranges
+        elif line.startswith("#EXTINF"):
+            found = re.match(r"#EXTINF:\s*([\d.]+)", line)
+            duration += float(found.group(1)) if found else 0
+        elif not line.startswith("#"):
+            link = urllib.parse.urljoin(base, line)
+            rng = None
+            if pending:
+                start = pending[1] if pending[1] is not None else ends.get(link, 0)
+                rng = (start, start + pending[0] - 1)
+                ends[link] = rng[1] + 1
+                pending = None
+            ext = os.path.splitext(urllib.parse.urlsplit(link).path)[1].lower()
+            name = "%05d%s" % (sum(1 for x in items if x["seg"]), ext if re.match(r"^\.[a-z0-9]{1,4}$", ext) else ".ts")
+            found = re.match(r"#EXTINF:\s*([\d.]+)", local[-1]) if local and local[-1].startswith("#EXTINF") else None
+            items.append({"url": link, "range": rng, "file": name, "seg": True,
+                          "duration": float(found.group(1)) if found else 0})
+            line = name
+        local.append(line)
+    if not any(x["seg"] for x in items):
+        log("  %s: the playlist lists no segments, ffmpeg gets the stream" % job["name"], job)
+        return None
+    return {"media": base, "lines": local, "items": items, "duration": duration}
+
+
+def fetch_segment(job, headers, item, folder, ctl, inflight):
+    """Download one key, init section or segment into the segments folder (as .tmp until it is complete).
+    A .tmp left by a pause or a failed try is continued with a range request (from the start again when the server
+    sends the whole segment instead). inflight[file] = [bytes so far, expected bytes or 0] while it runs, for the
+    progress. Returns an error or None. A slow down answer (429, 503) is not a failed try, like for direct downloads."""
+    path = os.path.join(folder, item["file"])
+    attempt = 0
+    error = None
+    while attempt <= SEGMENT_RETRIES and not ctl["stop"]:
+        site = site_take(job, ctl)
+        if site is None:
+            return None
+        have = os.path.getsize(path + ".tmp") if os.path.exists(path + ".tmp") else 0
+        inflight[item["file"]] = [have, 0]
+        try:
+            h = dict(headers)
+            start, end = item["range"] or (0, None)
+            if item["range"] or have:
+                h["Range"] = "bytes=%d-%s" % (start + have, "" if end is None else end)
+            with urllib.request.urlopen(urllib.request.Request(item["url"], headers=h), timeout=30) as r:
+                if item["range"] and r.status != 206:
+                    raise IOError("server ignored the range request (status %d)" % r.status)
+                if r.status != 206:
+                    have = 0  # the whole segment came: start the .tmp again
+                expect = int(r.headers.get("Content-Length") or 0)
+                expect = have + expect if expect else 0
+                inflight[item["file"]] = [have, expect]
+                f = open(path + ".tmp", "ab" if have else "wb")
+                got = have
+                with f:
+                    while not ctl["stop"]:
+                        # read1: what has arrived, up to the size, so progress and pause do not wait for a full chunk
+                        data = r.read1(8192 if job["limit"] or current_limit() else CHUNK)
+                        if not data:
+                            break
+                        f.write(data)
+                        got += len(data)
+                        inflight[item["file"]][0] = got
+                        site_count(site, len(data), job)
+                        throttle(job, ctl, len(data))
+            if ctl["stop"] and not (expect and got == expect):  # paused: the .tmp stays, the next try goes on from it
+                return None
+            if expect and got != expect:
+                raise IOError("got %d of %d bytes" % (got, expect))
+            os.replace(path + ".tmp", path)
+            return None
+        except Exception as e:
+            if getattr(e, "code", None) in SLOW_CODES:
+                slow_down(site, e, job)
+                continue  # wait for the site (in site_take), then the same try again
+            if getattr(e, "code", None) == 416 and have:  # the .tmp is not a part of this segment: start it again
+                os.remove(path + ".tmp")
+                continue
+            error = error_text(e)
+            ctl["code"] = getattr(e, "code", None)
+            log("  segment %s failed (try %d of %d): %s" % (item["file"], attempt + 1, 1 + SEGMENT_RETRIES, error), job)
+            if error.startswith(BAD_CERT):
+                return error
+            attempt += 1
+            if attempt <= SEGMENT_RETRIES:
+                time.sleep(1)
+        finally:
+            site_give(site)
+            inflight.pop(item["file"], None)
+    return error
+
+
+def hls_download(job, ctl, plan, ffmpeg):
+    """Download the plan's segments in parallel, then join them into the mp4 (or mp3). Returns an error or None."""
+    # ---- input: the segments folder; one from another quality or another stream is started again ----
+    name, target, part = job["name"], job["path"], job["path"] + ".part"
+    headers = request_headers(job, ctl)
+    folder = segments_dir(job)
+    signature = json.dumps({"media": plan["media"].split("?")[0], "files": [x["file"] for x in plan["items"]]})
+    sig_path = os.path.join(folder, "playlist.json")
+    try:
+        with open(sig_path) as f:
+            same = f.read() == signature
+    except OSError:
+        same = False
+    if not same and os.path.isdir(folder):
+        shutil.rmtree(folder, ignore_errors=True)
+    os.makedirs(folder, exist_ok=True)
+    with open(sig_path, "w") as f:
+        f.write(signature)
+    with open(os.path.join(folder, "local.m3u8"), "w", encoding="utf-8") as f:
+        f.write("\n".join(plan["lines"]) + "\n")
+
+    items = plan["items"]
+    segs = [x for x in items if x["seg"]]
+    have = lambda x: os.path.exists(os.path.join(folder, x["file"]))  # noqa: E731
+    todo = collections.deque(x for x in items if not have(x))
+    sizes = {x["file"]: os.path.getsize(os.path.join(folder, x["file"])) for x in items if have(x)}
+    started = time.time() - (job["elapsed"] if same else 0)
+    log("starting stream: %s, %d segments (%d already on disk), %.0fs of video, up to %d connections"
+        % (name, len(segs), sum(1 for x in segs if have(x)), plan["duration"], max(1, int(settings["parts"]))), job)
+
+    # ---- process: up to "parts" connections, each takes the next segment that is not on disk yet ----
+    inflight, failed, take = {}, [], threading.Lock()
+
+    def worker():
+        while not ctl["stop"] and not failed:
+            with take:
+                if not todo:
+                    return
+                item = todo.popleft()
+            error = fetch_segment(job, headers, item, folder, ctl, inflight)
+            if error:
+                failed.append(error)
+            elif have(item):
+                sizes[item["file"]] = os.path.getsize(os.path.join(folder, item["file"]))
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(max(1, int(settings["parts"])), len(todo)))]
+    for t in threads:
+        t.start()
+
+    # Plain TS segments (no key, no init section): ffmpeg joins them while they come in, fed in order through a
+    # pipe, so the file is ready right after the last segment instead of after a join of its own (2s for 500 MB).
+    # The segment files stay until the end, so a pause, a failure or a feed that is not TS loses nothing.
+    pipe = None
+    if all(x["seg"] for x in items) and all(x["file"].endswith(".ts") for x in segs):
+        pipe = {"proc": join_process(job, ffmpeg, ["-f", "mpegts", "-i", "pipe:0"], part, feed=True),
+                "error": None, "downloading": threading.Event()}
+        pipe["downloading"].set()
+        ctl["proc"] = pipe["proc"]  # pause and cancel kill it
+
+        def feeder():
+            stdin = pipe["proc"].stdin
+            try:
+                for x in segs:
+                    p = os.path.join(folder, x["file"])
+                    while not os.path.exists(p):
+                        if ctl["stop"] or not pipe["downloading"].is_set() and not os.path.exists(p):
+                            return
+                        time.sleep(0.05)
+                    with open(p, "rb") as f:
+                        if x is segs[0] and f.read(1) != b"\x47":  # every TS packet starts with 0x47
+                            pipe["error"] = "the segments are not MPEG-TS"
+                            pipe["proc"].kill()
+                            return
+                        f.seek(0)
+                        shutil.copyfileobj(f, stdin, 1 << 20)
+                stdin.close()
+            except OSError as e:  # ffmpeg ended (killed, or it failed: its own message says why)
+                pipe["error"] = pipe["error"] or str(e)
+
+        pipe["feeder"] = threading.Thread(target=feeder, daemon=True)
+        pipe["feeder"].start()
+
+    samples, last_print = [], 0
+    while True:
+        alive = any(t.is_alive() for t in threads)
+        flight = list(inflight.values())
+        done_segs = [x for x in segs if x["file"] in sizes]
+        done = sum(sizes.values()) + sum(n for n, _ in flight)
+        # segments done / total, a segment on its way counts with the part of it that is here
+        count = len(done_segs) + sum(n / total for n, total in flight if total)
+        known = sum(sizes[x["file"]] for x in done_segs)
+        total = int(known / len(done_segs) * len(segs)) if done_segs else None  # estimate from the finished ones
+        now = time.time()
+        speed = rate(samples, now, done, SPEED_WINDOW)
+        job.update(done=done, total=max(total, done) if total else None, speed=speed, elapsed=now - started,
+                   percent=100.0 * min(count, len(segs)) / len(segs),
+                   position=sum(x["duration"] for x in done_segs),
+                   eta=(total - done) / speed if total and speed > 0 and total > done else None)
+        job["detail"] = SLOW_DOWN if site_slowed(site_key(job["url"])) else \
+            "segment %d of %d" % (len(done_segs), len(segs))
+        if now - last_print > 2 or not alive:
+            log("  %s  %5.1f%%  %d of %d segments  %.0f KB/s" % (name, job["percent"], len(done_segs), len(segs),
+                                                                 speed / 1024), job)
+            last_print = now
+        if not alive:
+            break
+        time.sleep(0.5)
+    missing = [x for x in items if not have(x)]
+    if pipe:
+        pipe["downloading"].clear()
+        if ctl["stop"] or missing:
+            pipe["proc"].kill()
+        else:
+            job["detail"] = "joining segments"
+        pipe["feeder"].join()
+        try:  # a killed ffmpeg: what is left in the pipe can never be written, drop it here, not at garbage collection
+            pipe["proc"].stdin.close()
+        except OSError:
+            pass
+        error = join_wait(pipe["proc"], ctl, part)
+        if not error and not pipe["error"]:
+            return hls_done(job, plan, folder, part, started, len(segs))
+        if not ctl["stop"] and not missing:  # the pipe did not work for this stream: join from the files instead
+            log("  %s: joining while downloading failed (%s), joining the files" % (name, pipe["error"] or error), job)
+    if ctl["stop"]:
+        return "stopped"
+    if missing:
+        return ("a segment still failed after %d retries (%s). %d of %d segments are saved, Retry continues from there."
+                % (SEGMENT_RETRIES, failed[0] if failed else "connection closed", len(segs) - sum(1 for x in segs if not have(x)), len(segs)))
+
+    # ---- output: ffmpeg joins the local playlist into one file, no re-encoding (it also decrypts) ----
+    job["detail"] = "joining segments"
+    proc = ctl["proc"] = join_process(job, ffmpeg, ["-allowed_extensions", "ALL", "-protocol_whitelist", "file,crypto,data",
+                                                    "-i", os.path.join(folder, "local.m3u8")], part)
+    if ctl["stop"]:
+        proc.kill()
+    error = join_wait(proc, ctl, part)
+    if error:
+        return error
+    return hls_done(job, plan, folder, part, started, len(segs))
+
+
+def join_process(job, ffmpeg, inputs, part, feed=False):
+    """ffmpeg joining HLS segments into the job's file without re-encoding (mp3 for audio only).
+    feed: the segments come through stdin. Its messages are collected in proc.messages by a thread."""
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats"] + inputs
+    if job.get("audioOnly"):
+        cmd += ["-vn", "-sn", "-dn", "-c:a", "libmp3lame", "-q:a", "2", "-f", "mp3", part]
+    else:
+        cmd += ["-sn", "-dn", "-c", "copy", "-f", "mp4", part]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            stdin=subprocess.PIPE if feed else subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+    proc.messages = []
+    threading.Thread(target=lambda: proc.messages.append(proc.stdout.read().decode("utf-8", "replace")), daemon=True).start()
+    return proc
+
+
+def join_wait(proc, ctl, part):
+    """Wait for a join_process. Returns an error message (the part file is then deleted), or None."""
+    code = proc.wait()
+    ctl["proc"] = None
+    for _ in range(50):  # the reader thread gets ffmpeg's last words
+        if proc.messages:
+            break
+        time.sleep(0.01)
+    errors = "".join(proc.messages).strip()
+    if code != 0 or ctl["stop"] or not os.path.exists(part) or os.path.getsize(part) == 0:
+        if os.path.exists(part):
+            os.remove(part)
+        if ctl["stop"]:
+            return "stopped"
+        return "joining the segments failed (exit %d): %s" % (code & 0xFF or 1, errors.splitlines()[-1] if errors else "no error text")
+    return None
+
+
+def hls_done(job, plan, folder, part, started, count):
+    """The joined file gets its name, the segments go."""
+    os.replace(part, job["path"])
+    shutil.rmtree(folder, ignore_errors=True)
+    job["detail"] = "%d:%02d:%02d downloaded" % (plan["duration"] // 3600, plan["duration"] // 60 % 60, plan["duration"] % 60)
+    log("done: %s (%d bytes, %d segments, %.1fs)" % (job["name"], os.path.getsize(job["path"]), count,
+                                                     time.time() - started), job)
+    return None
+
+
 def stream(job, ctl):
     """HLS/DASH stream. A 5xx or network error is tried again after 5s, 15s and 30s; 403, 404 and
     anything else fail right away. Returns an error message, or None when done."""
@@ -1500,10 +1968,19 @@ def stream(job, ctl):
 
 
 def stream_once(job, ctl):
-    """One try: let ffmpeg fetch and join the stream. Returns an error message, or None when done."""
+    """One try: HLS segments in parallel (hls_download), or else ffmpeg fetches and joins the stream by itself.
+    Returns an error message, or None when done."""
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         return NO_FFMPEG
+    try:
+        plan = hls_plan(job, request_headers(job, ctl))
+    except Exception as e:
+        plan = None
+        log("  %s: the playlist could not be read (%s), ffmpeg gets the stream" % (job["name"], error_text(e)), job)
+    job["pausable"] = bool(plan)  # its segments stay on disk: pause and resume like a file
+    if plan:
+        return hls_download(job, ctl, plan, ffmpeg)
 
     # ---- input: the job from the browser, turned into ffmpeg options ----
     name = job["name"]
@@ -1582,6 +2059,10 @@ def stream_once(job, ctl):
     if code != 0 or ctl["stop"] or not os.path.exists(part) or os.path.getsize(part) == 0:
         if os.path.exists(part):
             os.remove(part)
+        # ffmpeg checks certificates itself (GnuTLS): "Peer certificate failed verification", "The certificate's
+        # owner does not match hostname ..."
+        if any(re.search(r"\[tls @ .*certificate", x, re.I) for x in errors):
+            return BAD_CERT
         # Windows shows ffmpeg's negative error numbers as huge ones (2812791304), the low byte is
         # the code other systems show (8)
         return "ffmpeg failed (exit %d): %s" % (code & 0xFF or 1, " | ".join(errors[-3:]) or "no error text")
@@ -1595,8 +2076,10 @@ def run(job_id):
     """Worker thread for one job: download it and record how it ended."""
     job, ctl = jobs[job_id], live[job_id]
     is_stream = job["kind"] == "stream"
-    if is_stream:  # a stream always starts again from the beginning
-        job.update(done=0, total=None, percent=None, elapsed=0, position=0)
+    if is_stream:  # ffmpeg starts a stream again from the beginning; segments on disk are counted again
+        job.update(done=0, total=None, percent=None, position=0)
+        if not job.get("pausable"):
+            job["elapsed"] = 0
     job.update(detail="", speed=0, eta=None, finished=None, notified=False, refresh=False, scan="", threat="")
     ctl["error"], ctl["code"] = "", None
     started = time.time() - job["elapsed"]
@@ -1616,7 +2099,7 @@ def run(job_id):
             if not error:
                 scan(job)
     except Exception as e:
-        error = str(e) or repr(e)
+        error = error_text(e)
 
     # ---- output: the new state ----
     stop, ctl["stop"] = ctl["stop"], ""
@@ -1631,7 +2114,7 @@ def run(job_id):
         job.update(state="canceled", detail="", done=0, percent=None)
         log("canceled %s" % job["name"], job)
     elif stop == "pause":
-        job.update(state="stopped" if is_stream else "paused", detail="")
+        job.update(state="stopped" if is_stream and not job.get("pausable") else "paused", detail="")
         log("%s %s" % (job["state"], job["name"]), job)
     else:
         # a direct download that had already started and then got 403, 404 or 410: the link expired
@@ -1766,7 +2249,7 @@ def add(msg):
                         "added": time.time(), "finished": None, "variant": variant, "subtitles": subtitles,
                         "subFormat": "srt" if msg.get("subFormat") == "srt" else "vtt", "audioOnly": audio,
                         "refresh": False, "sha256": "", "hashing": None, "private": private, "scan": "", "threat": "",
-                        "named": is_stream or bool(file_name_of(msg.get("filename")))}
+                        "named": is_stream or bool(file_name_of(msg.get("filename"))), "pausable": False}
         live[job_id] = {"stop": "", "proc": None, "cookies": msg.get("cookies", ""), "queued": bool(msg.get("queue"))}
         job = jobs[job_id]
         log("job %s: %s from %s%s" % (job_id, name, urllib.parse.urlsplit(url).hostname or "?",
@@ -1838,7 +2321,7 @@ def control(msg):
                 remove_parts(job)
                 job.update(state="canceled", detail="", done=0, percent=None, finished=time.time())
             else:
-                job["state"] = "stopped" if job["kind"] == "stream" else "paused"
+                job["state"] = "stopped" if job["kind"] == "stream" and not job.get("pausable") else "paused"
         elif action in ("pause", "cancel") and state == "running":
             # the worker thread sees this, stops, and sets the new state itself
             ctl["stop"] = action
@@ -1889,7 +2372,7 @@ def refresh(msg):
             size = int(r.headers["Content-Range"].split("/")[1]) if r.status == 206 \
                 else int(r.headers.get("Content-Length") or 0)
     except Exception as e:
-        return "the new link does not work: %s" % e
+        return "the new link does not work: %s" % error_text(e)
     if size != job["total"]:
         return ("size does not match: the new link is %s, this download is %s. It may be a different file, "
                 "so the download was not continued." % (format(size, ","), format(job["total"], ",")))
@@ -2467,7 +2950,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     reply = {"ok": False, "error": "unknown message type: %s" % kind}
             except Exception as e:
-                reply = {"ok": False, "error": str(e) or repr(e)}
+                reply = {"ok": False, "error": error_text(e)}
         with lock:
             body = json.dumps(reply).encode()
         self.send_response(200 if allowed else 403)
@@ -2563,6 +3046,8 @@ def main():
     if not find_ffmpeg():
         log(NO_FFMPEG)
     load_settings()
+    if CERT_CHECK != "Windows":
+        log("truststore is not installed: https certificates are checked with Python's own list, not Windows'")
     use_proxy()
     if settings["proxyMode"] != "none":
         log("network: %s" % proxy_text(proxy_conf()))

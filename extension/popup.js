@@ -100,7 +100,7 @@ function describe(job) {
     if (job.detail) parts.push(job.detail); // "2 subtitles saved"
     if (scanText(job)) parts.push(scanText(job)); // "scanned, clean"
   } else if (job.state === "stopped") {
-    parts.push("streams cannot pause: Restart starts from the beginning");
+    parts.push("this stream cannot pause: Restart starts from the beginning");
   } else if (job.state === "canceled") {
     // nothing more to say
   } else if (job.percent != null) {
@@ -260,7 +260,7 @@ async function showJobs() {
   document.getElementById("manager").onclick = () => chrome.tabs.create({ url: chrome.runtime.getURL("manager.html") });
   document.getElementById("allLinks").onclick = () => showLinks(tab);
   showJobs();
-  setInterval(showJobs, 1000);
+  setInterval(showJobs, 500); // twice a second, like IDM
 })();
 
 // ---- Download all links: every link on the page, with checkboxes, a type filter and a text filter ----

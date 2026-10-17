@@ -14,6 +14,45 @@ async function ask(message) {
   }
 }
 
+// Status (the popup and the manager ask twice a second) goes through one native host that stays open: starting a
+// new host for every message was measured at about 185 ms, a message to an open one at about 1 ms. The host answers
+// in order, so replies are matched to requests first in, first out. Slow messages (a stream's qualities, an import)
+// keep using ask(), so they never hold up the status. The host is closed after STATUS_IDLE without a status request.
+const STATUS_IDLE = 10000;
+let statusPort = null;
+let statusWaiting = []; // resolve functions, oldest first
+let statusTimer = 0;
+function closeStatusPort() {
+  if (statusWaiting.length) { statusTimer = setTimeout(closeStatusPort, STATUS_IDLE); return; }
+  if (statusPort) statusPort.disconnect();
+  statusPort = null;
+}
+function askStatus() {
+  clearTimeout(statusTimer);
+  statusTimer = setTimeout(closeStatusPort, STATUS_IDLE);
+  return new Promise((resolve) => {
+    try {
+      if (!statusPort) {
+        const port = statusPort = chrome.runtime.connectNative(HOST);
+        port.onMessage.addListener((reply) => {
+          const next = statusWaiting.shift();
+          if (next) next(reply || { ok: false, error: "empty reply" });
+        });
+        port.onDisconnect.addListener(() => {
+          const error = (chrome.runtime.lastError && chrome.runtime.lastError.message) || "native host closed";
+          if (statusPort === port) statusPort = null;
+          for (const next of statusWaiting.splice(0)) next({ ok: false, error });
+        });
+      }
+      statusWaiting.push(resolve);
+      statusPort.postMessage({ type: "status" });
+    } catch (e) { // no open host: the one message way still works
+      statusPort = null;
+      ask({ type: "status" }).then(resolve);
+    }
+  });
+}
+
 // The Cookie header the browser would send to this url. An incognito window has its own cookie store.
 async function cookieHeader(url, incognito) {
   const store = incognito && (await chrome.cookies.getAllCookieStores()).find((s) => s.id !== "0");
@@ -141,7 +180,7 @@ async function watch() {
   watching = true;
   try {
     for (;;) {
-      const reply = await ask({ type: "status" });
+      const reply = await askStatus();
       const jobs = Object.values(reply.jobs || {});
       const news = jobs.filter((j) => (j.state === "done" || j.state === "failed") && !j.notified);
       if (news.length) {
@@ -421,7 +460,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     ask({ type: "defender" }).then(sendResponse); // settings page, Security: can Windows Defender scan?
     return true;
   } else if (msg.type === "status") {
-    ask({ type: "status" }).then(sendResponse);
+    askStatus().then(sendResponse);
     return true;
   }
 });

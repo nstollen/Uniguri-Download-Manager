@@ -491,4 +491,4 @@ for (const [button, action, states] of [["startAll", "resume", ["paused", "stopp
 }
 
 show();
-setInterval(show, 1000);
+setInterval(show, 500); // twice a second, like IDM
